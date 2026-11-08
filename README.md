@@ -1,4 +1,4 @@
-# Theme Swich
+# Theme Switch
 
 <p align="center">
   <img src="theme-assets/theme-logo.png" alt="Rice — complete desktop profiles" width="100%">
@@ -6,7 +6,7 @@
 
 **A safer way to switch complete Hyprland desktop profiles.**
 
-Theme Swich is a Python command-line tool for managing Hyprland Rice profiles. A profile can bundle compositor and application configuration, GTK and icon settings, wallpapers, and other supported appearance files into one reversible switch.
+Theme Switch is a Python command-line tool for managing Hyprland Rice profiles. A profile can bundle compositor and application configuration, GTK and icon settings, wallpapers, and other supported appearance files into one reversible switch.
 
 > **Profiles are intentionally not included in this repository.** Keep profile data outside the source tree, in `~/.local/share/dotfile-themes` by default.
 
@@ -30,8 +30,8 @@ Install the latest version from GitHub and link the `theme` command into `~/.loc
 
 ```sh
 mkdir -p ~/.local/src ~/.local/bin &&
-git clone https://github.com/abdullah4xx/theme-swich.git ~/.local/src/theme-swich &&
-ln -sfn ~/.local/src/theme-swich/theme-switcher ~/.local/bin/theme
+git clone https://github.com/abdullah4xx/theme-switch.git ~/.local/src/theme-switch &&
+ln -sfn ~/.local/src/theme-switch/theme-switcher ~/.local/bin/theme
 ```
 
 If `~/.local/bin` is not already on your `PATH`, add it in your shell configuration:
