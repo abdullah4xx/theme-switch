@@ -2314,6 +2314,8 @@ def repository_profile_subdirectory(root):
             if name != ".git" and not (current_path / name).is_symlink()
         ]
         manifest = current_path / MANIFEST_NAME
+        if manifest.is_symlink():
+            raise ThemeError(f"Rice manifest must not be a symlink: {manifest}")
         if MANIFEST_NAME in files and not manifest.is_symlink():
             relative = current_path.relative_to(root)
             if relative.parts:
@@ -2325,6 +2327,67 @@ def repository_profile_subdirectory(root):
             "to choose one"
         )
     return candidates[0] if candidates else None
+
+
+def strip_repository_symlinks(root):
+    skipped = []
+    root = root.resolve()
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        kept_directories = []
+        for name in directories:
+            path = current_path / name
+            if name == ".git":
+                continue
+            if path.is_symlink():
+                if path.name == MANIFEST_NAME:
+                    kept_directories.append(name)
+                    continue
+                skipped.append(path.relative_to(root).as_posix())
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    raise ThemeError(
+                        f"could not skip repository symlink {path}: {exc}"
+                    ) from exc
+                continue
+            kept_directories.append(name)
+        directories[:] = kept_directories
+
+        for name in files:
+            path = current_path / name
+            if not path.is_symlink() or path.name == MANIFEST_NAME:
+                continue
+            skipped.append(path.relative_to(root).as_posix())
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise ThemeError(
+                    f"could not skip repository symlink {path}: {exc}"
+                ) from exc
+    return sorted(skipped)
+
+
+def repository_installer_scripts(root):
+    installer_names = {
+        "install.sh",
+        "install.py",
+        "setup.sh",
+        "setup.py",
+        "bootstrap.sh",
+    }
+    found = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directories[:] = [
+            name for name in directories
+            if name != ".git" and not (current_path / name).is_symlink()
+        ]
+        for name in files:
+            path = current_path / name
+            if name.lower() in installer_names and not path.is_symlink():
+                found.append(path.relative_to(root).as_posix())
+    return sorted(found)
 
 
 def validate_import_commands(data, name):
@@ -2405,6 +2468,22 @@ def cmd_add_interactive(_args):
         root = Path(temp_dir)
         checkout = root / "checkout"
         clone_repository(source, checkout)
+        installer_scripts = repository_installer_scripts(checkout)
+        skipped_symlinks = strip_repository_symlinks(checkout)
+        if skipped_symlinks:
+            info(
+                "Repository symlinks will be skipped (not installed): "
+                + ", ".join(skipped_symlinks)
+            )
+        if installer_scripts:
+            info(
+                "Installer scripts detected but will not be run: "
+                + ", ".join(installer_scripts)
+            )
+            info(
+                "Repository installers can change system packages or overwrite "
+                "personal files; review them separately before use."
+            )
         subdirectory = repository_profile_subdirectory(checkout)
         candidate, data = preflight_repository_profile(
             checkout,

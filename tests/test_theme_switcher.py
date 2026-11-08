@@ -204,6 +204,37 @@ class ThemeSwitcherTests(unittest.TestCase):
         with self.assertRaisesRegex(switcher.ThemeError, "multiple Rice profiles"):
             switcher.repository_profile_subdirectory(repository)
 
+    def test_repository_symlinks_are_skipped_without_following_them(self):
+        repository = self.root / "repository"
+        files = repository / ".config/quickshell/archeclipse"
+        files.mkdir(parents=True)
+        outside = self.root / "private.ini"
+        outside.write_text("private", encoding="utf-8")
+        (files / ".qmlls.ini").symlink_to(outside)
+        (files / "ordinary.conf").write_text("config", encoding="utf-8")
+
+        skipped = switcher.strip_repository_symlinks(repository)
+
+        self.assertEqual(skipped, [".config/quickshell/archeclipse/.qmlls.ini"])
+        self.assertFalse((files / ".qmlls.ini").exists())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "private")
+        self.assertEqual((files / "ordinary.conf").read_text(encoding="utf-8"), "config")
+
+    def test_repository_installer_scripts_are_reported_but_not_run(self):
+        repository = self.root / "repository"
+        installer = repository / ".config/hypr/maintenance/install.py"
+        installer.parent.mkdir(parents=True)
+        marker = self.root / "installer-ran"
+        installer.write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+            encoding="utf-8",
+        )
+
+        scripts = switcher.repository_installer_scripts(repository)
+
+        self.assertEqual(scripts, [".config/hypr/maintenance/install.py"])
+        self.assertFalse(marker.exists())
+
     def test_switch_restores_original_full_directory(self):
         active = switcher.HOME / ".config/rofi"
         active.mkdir(parents=True)

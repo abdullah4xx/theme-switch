@@ -53,7 +53,7 @@ theme undo                 # Return to the previous profile
 theme select               # Open the interactive picker
 ```
 
-`theme -add` asks for a public GitHub repository URL, checks its profile files and required programs, and explains any incompatibility before making changes. It asks for `y` before adding a compatible profile. It does not execute repository lifecycle commands or switch the active desktop; use `theme use <profile>` when you are ready to apply it.
+`theme -add` asks for a public GitHub repository URL, checks its profile files and required programs, and explains any incompatibility before making changes. Non-portable repository symlinks are listed and skipped. Detected installer scripts and lifecycle commands are reported but never run, and dependencies are checked rather than installed automatically. It asks for `y` before adding a compatible profile and does not switch the active desktop; use `theme use <profile>` when you are ready to apply it.
 
 To add a profile from a local directory or a Git repository:
 
