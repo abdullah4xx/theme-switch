@@ -26,13 +26,12 @@ Theme Swich is a Python command-line tool for managing Hyprland Rice profiles. A
 
 ## Install
 
-Clone the project and link the CLI into a directory on your `PATH`:
+Install the latest version from GitHub and link the `theme` command into `~/.local/bin`:
 
 ```sh
-git clone https://github.com/abdullah4xx/theme-swich.git \
-  /mnt/codx/projects/theme-swich
-mkdir -p ~/.local/bin
-ln -sfn /mnt/codx/projects/theme-swich/theme-switcher ~/.local/bin/theme
+mkdir -p ~/.local/src ~/.local/bin &&
+git clone https://github.com/abdullah4xx/theme-swich.git ~/.local/src/theme-swich &&
+ln -sfn ~/.local/src/theme-swich/theme-switcher ~/.local/bin/theme
 ```
 
 If `~/.local/bin` is not already on your `PATH`, add it in your shell configuration:
