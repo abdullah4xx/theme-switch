@@ -46,11 +46,14 @@ export PATH="$HOME/.local/bin:$PATH"
 theme list                 # Show installed profiles
 theme status               # Show the active profile
 theme doctor               # Check dependencies and profile state
+theme -add                 # Inspect and install a compatible GitHub profile
 theme preview hakuspace    # Preview a profile switch
 theme use hakuspace        # Apply a profile
 theme undo                 # Return to the previous profile
 theme select               # Open the interactive picker
 ```
+
+`theme -add` asks for a public GitHub repository URL, checks its profile files and required programs, and explains any incompatibility before making changes. It asks for `y` before adding a compatible profile. It does not execute repository lifecycle commands or switch the active desktop; use `theme use <profile>` when you are ready to apply it.
 
 To add a profile from a local directory or a Git repository:
 

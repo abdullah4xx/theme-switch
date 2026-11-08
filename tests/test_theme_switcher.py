@@ -74,6 +74,136 @@ class ThemeSwitcherTests(unittest.TestCase):
             "colorScheme": "prefer-dark",
         }])
 
+    def test_interactive_add_installs_compatible_github_profile_after_confirmation(self):
+        def clone_repository(_source, destination, branch=None):
+            profile_home = destination / "home/.config/waybar"
+            profile_home.mkdir(parents=True)
+            (profile_home / "config").write_text("{}", encoding="utf-8")
+            (destination / "theme.json").write_text(json.dumps({
+                "format": 1,
+                "id": "night-rice",
+                "name": "Night Rice",
+                "paths": [".config/waybar"],
+                "settings": {},
+                "requires": ["python3"],
+                "health_check": [],
+            }), encoding="utf-8")
+
+        with patch("builtins.input", side_effect=[
+            "https://github.com/example/night-rice.git",
+            "y",
+        ]), patch.object(switcher, "clone_repository", side_effect=clone_repository):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                switcher.cmd_add_interactive(None)
+
+        self.assertIn("compatibility check passed", output.getvalue())
+        self.assertIn("Installed Rice profile: Night Rice (night-rice)", output.getvalue())
+        self.assertTrue((switcher.THEMES / "night-rice/theme.json").is_file())
+        self.assertFalse((switcher.STATE / "active.json").exists())
+        self.assertEqual([item["id"] for item in switcher.list_profiles()], ["night-rice"])
+
+    def test_interactive_add_rejects_incompatible_profile_before_confirmation(self):
+        def clone_repository(_source, destination, branch=None):
+            profile_home = destination / "home"
+            profile_home.mkdir(parents=True)
+            (destination / "theme.json").write_text(json.dumps({
+                "format": 1,
+                "id": "bad-rice",
+                "name": "Bad Rice",
+                "paths": ["../.ssh"],
+                "settings": {},
+            }), encoding="utf-8")
+
+        with patch("builtins.input", return_value="https://github.com/example/bad-rice"), \
+                patch.object(switcher, "clone_repository", side_effect=clone_repository):
+            with self.assertRaisesRegex(switcher.ThemeError, "not suitable"):
+                switcher.cmd_add_interactive(None)
+
+        self.assertFalse((switcher.THEMES / "bad-rice").exists())
+
+    def test_interactive_add_reports_missing_requirements_without_installing(self):
+        missing_program = "__theme_switcher_missing_requirement_123__"
+
+        def clone_repository(_source, destination, branch=None):
+            profile_home = destination / "home/.config/waybar"
+            profile_home.mkdir(parents=True)
+            (profile_home / "config").write_text("{}", encoding="utf-8")
+            (destination / "theme.json").write_text(json.dumps({
+                "format": 1,
+                "id": "needs-tool",
+                "name": "Needs Tool",
+                "paths": [".config/waybar"],
+                "settings": {},
+                "requires": [missing_program],
+                "health_check": [],
+            }), encoding="utf-8")
+
+        with patch("builtins.input", return_value="https://github.com/example/needs-tool"), \
+                patch.object(switcher, "clone_repository", side_effect=clone_repository):
+            with self.assertRaisesRegex(switcher.ThemeError, missing_program):
+                switcher.cmd_add_interactive(None)
+
+        self.assertFalse((switcher.THEMES / "needs-tool").exists())
+
+    def test_interactive_add_declines_install_without_writing_profile(self):
+        def clone_repository(_source, destination, branch=None):
+            profile_home = destination / "home/.config/waybar"
+            profile_home.mkdir(parents=True)
+            (profile_home / "config").write_text("{}", encoding="utf-8")
+            (destination / "theme.json").write_text(json.dumps({
+                "format": 1,
+                "id": "declined-rice",
+                "name": "Declined Rice",
+                "paths": [".config/waybar"],
+                "settings": {},
+                "health_check": [],
+            }), encoding="utf-8")
+
+        with patch("builtins.input", side_effect=[
+            "https://github.com/example/declined-rice",
+            "n",
+        ]), patch.object(switcher, "clone_repository", side_effect=clone_repository):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                switcher.cmd_add_interactive(None)
+
+        self.assertIn("Installation cancelled", output.getvalue())
+        self.assertFalse((switcher.THEMES / "declined-rice").exists())
+
+    def test_theme_add_flag_is_parsed_as_interactive_add(self):
+        args = switcher.build_parser().parse_args(["-add"])
+
+        self.assertTrue(args.interactive_add)
+        self.assertIsNone(args.command)
+
+    def test_interactive_add_accepts_only_repository_level_public_github_urls(self):
+        self.assertEqual(
+            switcher.github_repository_name("https://github.com/example/night-rice.git"),
+            "night-rice",
+        )
+        for source in (
+            "http://github.com/example/night-rice",
+            "https://github.com.evil/example/night-rice",
+            "https://github.com/example/night-rice/tree/main",
+        ):
+            with self.subTest(source=source), self.assertRaises(switcher.ThemeError):
+                switcher.github_repository_name(source)
+
+    def test_repository_profile_discovery_requires_a_single_manifest(self):
+        repository = self.root / "repository"
+        nested_profile = repository / "rice/theme.json"
+        nested_profile.parent.mkdir(parents=True)
+        nested_profile.write_text("{}", encoding="utf-8")
+
+        self.assertEqual(switcher.repository_profile_subdirectory(repository), "rice")
+
+        other_profile = repository / "another/theme.json"
+        other_profile.parent.mkdir(parents=True)
+        other_profile.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(switcher.ThemeError, "multiple Rice profiles"):
+            switcher.repository_profile_subdirectory(repository)
+
     def test_switch_restores_original_full_directory(self):
         active = switcher.HOME / ".config/rofi"
         active.mkdir(parents=True)

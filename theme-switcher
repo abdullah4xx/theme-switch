@@ -5,9 +5,11 @@ import argparse
 import ast
 import base64
 import curses
+import contextlib
 import difflib
 import fcntl
 import hashlib
+import io
 import json
 import locale
 import os
@@ -22,6 +24,7 @@ import textwrap
 import time
 import uuid
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 HOME = Path.home()
 DEFAULT_THEMES = Path(
@@ -2242,6 +2245,210 @@ def cmd_use(args):
         )
 
 
+def clone_repository(source, destination, branch=None):
+    if branch is not None and (not branch.strip() or branch.startswith("-")):
+        raise ThemeError(f"invalid Git branch name: {branch!r}")
+    command = ["git", "clone", "--depth", "1"]
+    if branch:
+        command.extend(["--branch", branch])
+    command.extend(["--", source, str(destination)])
+    env = os.environ.copy()
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_LFS_SKIP_SMUDGE": "1",
+    })
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise ThemeError(f"git clone failed: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or "").strip()
+        raise ThemeError("git clone failed" + (f": {detail}" if detail else ""))
+
+
+def github_repository_name(source):
+    try:
+        parsed = urlparse(source)
+        port = parsed.port
+    except ValueError as exc:
+        raise ThemeError("invalid GitHub repository URL") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or parsed.username
+        or parsed.password
+        or port
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ThemeError("enter a public HTTPS GitHub repository URL")
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ThemeError("use the repository URL, not a file, branch, or subdirectory URL")
+    name = parts[1][:-4] if parts[1].endswith(".git") else parts[1]
+    valid_name(name)
+    return name
+
+
+def repository_profile_subdirectory(root):
+    root_manifest = root / MANIFEST_NAME
+    if root_manifest.is_symlink():
+        raise ThemeError("the repository root theme.json must not be a symlink")
+    if root_manifest.is_file():
+        return None
+
+    candidates = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directories[:] = [
+            name for name in directories
+            if name != ".git" and not (current_path / name).is_symlink()
+        ]
+        manifest = current_path / MANIFEST_NAME
+        if MANIFEST_NAME in files and not manifest.is_symlink():
+            relative = current_path.relative_to(root)
+            if relative.parts:
+                candidates.append(relative.as_posix())
+    if len(candidates) > 1:
+        found = ", ".join(sorted(candidates))
+        raise ThemeError(
+            f"multiple Rice profiles found ({found}); use 'theme add NAME URL --dir PATH' "
+            "to choose one"
+        )
+    return candidates[0] if candidates else None
+
+
+def validate_import_commands(data, name):
+    for field in ("health_check", "post_apply"):
+        commands = data.get(field, [])
+        if not isinstance(commands, list):
+            raise ThemeError(f"invalid {field} list in Rice: {name}")
+        for command in commands:
+            if not isinstance(command, str) or not command.strip():
+                raise ThemeError(f"invalid command in {field} for Rice: {name}")
+            try:
+                if not shlex.split(command):
+                    raise ThemeError(f"empty command in {field} for Rice: {name}")
+            except ValueError as exc:
+                raise ThemeError(f"invalid command in {field} for Rice {name}: {exc}") from exc
+
+
+def preflight_repository_profile(checkout, name, subdirectory, staging_root):
+    global THEMES
+    previous_themes = THEMES
+    THEMES = staging_root
+    output = io.StringIO()
+    errors = io.StringIO()
+    try:
+        try:
+            staging_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ThemeError(f"could not prepare profile inspection: {exc}") from exc
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                add_theme(name, str(checkout), directory=subdirectory)
+                profile_directory, data = profile(name)
+                validate_import_commands(data, name)
+                total_size = sum(
+                    dir_size(safe_source(profile_directory / "home", relative))
+                    for relative in data["paths"]
+                )
+                assets = profile_directory / "assets"
+                if assets.is_dir():
+                    total_size += dir_size(assets)
+                if total_size > MAX_THEME_BYTES:
+                    raise ThemeError(f"Rice exceeds the {MAX_THEME_BYTES // (1024 * 1024)} MiB size limit")
+                missing = missing_requirements(data)
+                if missing:
+                    raise ThemeError(
+                        f"missing required programs: {', '.join(missing)}"
+                    )
+        except SystemExit as exc:
+            detail = errors.getvalue().strip() or output.getvalue().strip()
+            detail = detail.splitlines()[-1] if detail else "profile import failed"
+            detail = re.sub(r"^error \[RICE-001\]:\s*", "", detail)
+            raise ThemeError(f"repository is not suitable: {detail}") from exc
+        except ThemeError as exc:
+            raise ThemeError(f"repository is not suitable: {exc}") from exc
+    finally:
+        THEMES = previous_themes
+    return profile_directory, data
+
+
+def cmd_add_interactive(_args):
+    try:
+        source = input("GitHub repository URL: ").strip()
+    except EOFError as exc:
+        raise ThemeError("'theme -add' must be run interactively") from exc
+    if not source:
+        raise ThemeError("no GitHub repository URL was provided")
+
+    name = github_repository_name(source)
+    destination = themes_root() / name
+    if destination.exists() or destination.is_symlink():
+        raise ThemeError(f"Rice already exists: {name}")
+
+    try:
+        temp_directory = tempfile.TemporaryDirectory(prefix=f"{name}-preflight-")
+    except OSError as exc:
+        raise ThemeError(f"could not create a temporary inspection directory: {exc}") from exc
+    with temp_directory as temp_dir:
+        root = Path(temp_dir)
+        checkout = root / "checkout"
+        clone_repository(source, checkout)
+        subdirectory = repository_profile_subdirectory(checkout)
+        candidate, data = preflight_repository_profile(
+            checkout,
+            name,
+            subdirectory,
+            root / "staging-vault",
+        )
+        source_profile = checkout / subdirectory if subdirectory else checkout
+        if not (source_profile / MANIFEST_NAME).is_file():
+            data["description"] = f"Imported from {source}"
+            atomic_json(candidate / MANIFEST_NAME, data)
+
+        info("Repository compatibility check passed.")
+        info(f"Profile: {data.get('name', name)} ({name})")
+        if data.get("description"):
+            info(f"Description: {data['description']}")
+        info(f"Managed paths: {', '.join(data['paths'])}")
+        if data.get("requires"):
+            info(f"Required programs found: {', '.join(data['requires'])}")
+        if data.get("extra_paths"):
+            info(f"Additional managed paths: {', '.join(data['extra_paths'])}")
+        commands = data.get("post_apply", []) + data.get("health_check", [])
+        if commands:
+            info("Lifecycle commands are declared; they will not run during inspection or installation:")
+            for command in commands:
+                info(f"  {command}")
+        info("This only installs the profile; it does not apply it to your desktop.")
+
+        try:
+            answer = input("Install this profile? [y/N]: ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer != "y":
+            info("Installation cancelled; no profile was added.")
+            return
+
+        add_theme(name, str(candidate), rewrite_paths=False)
+        _installed_directory, installed_data = profile(name)
+        if not any(item["id"] == name for item in list_profiles()):
+            raise ThemeError(f"installed Rice is missing from the profile list: {name}")
+        info(f"Installed Rice profile: {installed_data.get('name', name)} ({name})")
+        info(f"Activate it later with: theme use {name}")
+
+
 def add_theme(name, source, *, directory=None, branch=None, rewrite_paths=True):
     """Import a local dotfiles directory or shallow-clone a Git repository."""
     valid_name(name)
@@ -2281,37 +2488,9 @@ def add_theme(name, source, *, directory=None, branch=None, rewrite_paths=True):
         import_directory(repository)
         return
 
-    if branch is not None and (not branch.strip() or branch.startswith("-")):
-        raise ThemeError(f"invalid Git branch name: {branch!r}")
     with tempfile.TemporaryDirectory(prefix=f"{name}-git-") as temp_dir:
         checkout = Path(temp_dir) / "checkout"
-        command = ["git", "clone", "--depth", "1"]
-        if branch:
-            command.extend(["--branch", branch])
-        command.extend(["--", clone_source, str(checkout)])
-        env = os.environ.copy()
-        env.update({
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_LFS_SKIP_SMUDGE": "1",
-        })
-        try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env=env,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise ThemeError(f"git clone failed: {exc}") from exc
-        if result.returncode:
-            detail = (result.stderr or "").strip()
-            raise ThemeError(
-                "git clone failed" + (f": {detail}" if detail else "")
-            )
+        clone_repository(clone_source, checkout, branch=branch)
         import_directory(checkout)
 
 
@@ -3058,6 +3237,13 @@ def build_parser():
         prog="theme",
         description="Switch complete Hyprland Rice profiles with isolated configs.",
     )
+    parser.add_argument(
+        "-add",
+        "--add",
+        dest="interactive_add",
+        action="store_true",
+        help="inspect and install a Rice profile from a GitHub repository",
+    )
     sub = parser.add_subparsers(dest="command", required=False)
 
     p_list = sub.add_parser("list", help="list installed Rice profiles")
@@ -3118,7 +3304,9 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "list":
+        if args.interactive_add:
+            cmd_add_interactive(args)
+        elif args.command == "list":
             cmd_list(args)
         elif args.command == "status":
             cmd_status(args)
