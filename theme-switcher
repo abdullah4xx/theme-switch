@@ -1,0 +1,3165 @@
+#!/usr/bin/env python3
+"""Switch complete Hyprland Rice profiles atomically."""
+
+import argparse
+import ast
+import base64
+import curses
+import difflib
+import fcntl
+import hashlib
+import json
+import locale
+import os
+import re
+import shutil
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import uuid
+from pathlib import Path, PurePosixPath
+
+HOME = Path.home()
+DEFAULT_THEMES = Path(
+    os.environ.get("DOTFILES_THEME_ROOT", HOME / ".local/share/dotfile-themes")
+).expanduser()
+THEMES = DEFAULT_THEMES
+VAULT = DEFAULT_THEMES
+STATE = Path(os.environ.get("DOTFILES_THEME_STATE", HOME / ".local/state/dotfile-themes")).expanduser()
+
+MANIFEST_NAME = "theme.json"
+THEME_LOGO = Path(__file__).resolve().parent / "theme-assets/theme-logo.png"
+KITTY_LOGO_ID = 724618
+MAX_THEME_BYTES = 220 * 1024 * 1024
+WALLPAPER_MAX_BYTES = 30 * 1024 * 1024
+HEALTH_CHECK_WAIT = 3.0
+PROCESS_STOP_TIMEOUT = 2.0
+MAX_CONFIG_TEXT_BYTES = 1024 * 1024
+ALLOWED_EXTRA_PATHS = {".local/share/fonts", ".local/bin"}
+ALLOWED_TRACKED_PATHS = {".local/state/hakuspace/rofi-theme.rasi"}
+EXECUTABLE_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")
+HOME_PATH_RE = re.compile(r"/home/[^/\s\"'<>]+/")
+CONFIG_TEXT_EXTENSIONS = {
+    ".cfg", ".conf", ".css", ".desktop", ".fish", ".ini", ".json", ".jsonc",
+    ".lua", ".qml", ".rasi", ".service", ".sh", ".toml", ".xml", ".yaml",
+    ".yml", ".zsh",
+}
+CONFIG_TEXT_NAMES = {"config", ".bashrc", ".profile", ".zshrc"}
+
+# Appearance paths that can safely be managed as theme-owned files.
+ALLOWED_HOME_PREFIXES = (
+    ".config",
+    ".themes",
+    ".icons",
+    ".fonts",
+    ".local/share/fonts",
+    ".local/share/icons",
+    ".local/share/themes",
+    ".local/share/backgrounds",
+    ".local/share/color-schemes",
+    ".local/share/konsole",
+    ".local/share/plasma",
+    ".local/share/kwin",
+    ".local/share/wallpapers",
+    ".local/share/aurorae",
+)
+ALLOWED_HOME_FILES = (".Xresources", ".gtkrc-2.0", ".nanorc", ".xsettingsd")
+
+# Blacklisted sub-directories (never touched)
+DENIED_CONFIG_DIRS = {
+    "brave", "brave-browser", "chromium", "dconf", "floorp",
+    "google-chrome", "herdr", "herdr-app", "herdr-core", "keyrings",
+    "librewolf", "microsoft-edge", "mozilla", "opera", "opera-gx",
+    "thorium", "vivaldi", "vivaldi-snapshot", "waterfox", "yandex-browser",
+}
+
+SETTINGS_FIELDS = ("gtk_theme", "icon_theme", "cursor_theme", "color_scheme", "gtk_font")
+USER_PRESERVED_PATHS = (
+    ".config/hypr/hyprland.lua",
+    ".config/gtk-3.0/settings.ini",
+    ".config/gtk-4.0/settings.ini",
+    ".config/kitty/kitty.conf",
+)
+GTK_FONT_PATHS = {
+    ".config/gtk-3.0/settings.ini",
+    ".config/gtk-4.0/settings.ini",
+}
+KITTY_CONFIG_PATH = ".config/kitty/kitty.conf"
+KITTY_FONT_KEYS = {
+    "font_family",
+    "font_size",
+    "bold_font",
+    "italic_font",
+    "bold_italic_font",
+    "symbol_map",
+    "shell",
+}
+VALID_COLOR_SCHEMES = (None, "default", "prefer-dark", "prefer-light")
+NAME_RE = re.compile(r"^[A-Za-z0-9._+-]{1,80}$")
+
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
+
+class ThemeError(Exception):
+    pass
+
+
+def die(message, code=1):
+    print(f"error [RICE-001]: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(message):
+    print(message)
+
+
+def warn(message):
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def now_ts():
+    return int(time.time())
+
+
+def themes_root() -> Path:
+    """Return the active theme directory, honoring legacy VAULT overrides."""
+    if Path(THEMES) != DEFAULT_THEMES:
+        return Path(THEMES)
+    if Path(VAULT) != DEFAULT_THEMES:
+        return Path(VAULT)
+    return Path(THEMES)
+
+
+def ensure_state_dirs():
+    themes_root().mkdir(parents=True, exist_ok=True)
+    (STATE / "backups").mkdir(parents=True, exist_ok=True)
+
+
+def validate_extra_paths(extra_paths):
+    if not isinstance(extra_paths, list) or any(
+        not isinstance(path, str) or path not in ALLOWED_EXTRA_PATHS
+        for path in extra_paths
+    ):
+        raise ThemeError("extra_paths must contain only explicitly allowed paths")
+    return tuple(dict.fromkeys(extra_paths))
+
+
+def validate_tracked_paths(paths):
+    if not isinstance(paths, list) or any(
+        not isinstance(path, str) or path not in ALLOWED_TRACKED_PATHS
+        for path in paths
+    ):
+        raise ThemeError("tracked_paths must contain only explicitly allowed paths")
+    return tuple(dict.fromkeys(paths))
+
+
+def safe_home_path(relative: str, *, extra_paths=()) -> Path:
+    """Resolve a relative path under $HOME, rejecting escapes."""
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        raise ThemeError(f"invalid home path: {relative!r}")
+    parts = PurePosixPath(relative).parts
+    if not parts or PurePosixPath(relative).is_absolute() or ".." in parts:
+        raise ThemeError(f"unsafe path: {relative}")
+    allowed = relative in ALLOWED_HOME_FILES or any(
+        relative == prefix or relative.startswith(prefix + "/")
+        for prefix in ALLOWED_HOME_PREFIXES
+    )
+    allowed = allowed or any(
+        relative == prefix or relative.startswith(prefix + "/")
+        for prefix in validate_extra_paths(list(extra_paths))
+    )
+    if not allowed or relative == ".config":
+        raise ThemeError(f"disallowed appearance path: {relative}")
+    if parts[0] == ".config" and len(parts) > 1 and parts[1].lower() in DENIED_CONFIG_DIRS:
+        raise ThemeError(f"blacklisted path: {relative}")
+    target = HOME.joinpath(*parts)
+    resolved = target.resolve(strict=False)
+    if not (
+        resolved.is_relative_to(HOME.resolve(strict=False))
+        or resolved.is_relative_to(themes_root().resolve(strict=False))
+    ):
+        raise ThemeError(f"path escapes home through a symlink: {relative}")
+    return target
+
+
+def safe_source(root: Path, value: str) -> Path:
+    """Resolve a file inside a theme directory, rejecting escapes."""
+    if not isinstance(value, str) or not value:
+        raise ThemeError(f"invalid theme source path: {value!r}")
+    p = (root / value).resolve()
+    if not p.is_relative_to(root.resolve()):
+        raise ThemeError(f"unsafe source path: {value}")
+    return p
+
+
+def path_key(relative: str) -> str:
+    """Stable filesystem-safe key for a relative path."""
+    return hashlib.sha256(relative.encode("utf-8")).hexdigest()
+
+
+def valid_name(name: str):
+    if not NAME_RE.match(name):
+        raise ThemeError(f"invalid theme name: {name}")
+
+
+def atomic_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("x", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def read_json(path: Path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def copy_tree(source: Path, destination: Path, *, reject_links=True):
+    """Copy a tree while preserving links only when explicitly permitted."""
+    if source.is_symlink():
+        if reject_links:
+            raise ThemeError(f"symlinks are not allowed: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
+        return
+    if source.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        for child in sorted(source.iterdir()):
+            copy_tree(child, destination / child.name, reject_links=reject_links)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def remove_path(path: Path):
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def dir_size(path: Path) -> int:
+    total = 0
+    if path.is_file():
+        return path.stat().st_size
+    for root, _dirs, files in os.walk(path, followlinks=False):
+        for f in files:
+            fp = Path(root) / f
+            if not fp.is_symlink():
+                total += fp.stat().st_size
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Theme manifest & profile
+# ---------------------------------------------------------------------------
+
+def list_profiles():
+    """Return sorted list of installed theme manifests."""
+    profiles = []
+    root = themes_root()
+    if not root.is_dir():
+        return profiles
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        manifest = entry / MANIFEST_NAME
+        if not manifest.is_file():
+            continue
+        data = read_json(manifest)
+        if not isinstance(data, dict):
+            continue
+        if data.get("format") not in (1, 2) or not data.get("id") or not isinstance(data.get("paths"), list):
+            continue
+        data["_dir"] = entry
+        profiles.append(data)
+    return sorted(profiles, key=lambda p: p["id"])
+
+
+def validate_process_fields(data, name):
+    fields = {
+        "requires": "executable",
+        "stop": "process name",
+        "start": "command",
+    }
+    for field, kind in fields.items():
+        value = data.get(field, [])
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            raise ThemeError(f"invalid {field} list in theme: {name}")
+        for item in value:
+            if field in ("requires", "stop"):
+                if not EXECUTABLE_RE.fullmatch(item):
+                    raise ThemeError(f"invalid {kind} in theme {name}: {item!r}")
+            else:
+                if "\0" in item or "\n" in item or "\r" in item:
+                    raise ThemeError(f"invalid start command in theme: {name}")
+                try:
+                    argv = shlex.split(item)
+                except ValueError as exc:
+                    raise ThemeError(f"invalid start command in theme {name}: {exc}") from exc
+                if not argv:
+                    raise ThemeError(f"invalid start command in theme: {name}")
+
+
+def protected_paths(data):
+    """Keep personal Hyprland bindings and GTK font choices outside Rice control."""
+    paths = data.get("paths", [])
+    excludes = set(data.get("excludes", []))
+    for protected in USER_PRESERVED_PATHS:
+        if any(
+            path == protected or protected.startswith(path + "/")
+            for path in paths
+        ):
+            excludes.add(protected)
+    return excludes
+
+
+def missing_requirements(data):
+    return [program for program in data.get("requires", []) if not shutil.which(program)]
+
+
+def check_requirements(name, data, *, force=False):
+    missing = missing_requirements(data)
+    if missing and not force:
+        raise ThemeError(
+            f"theme {name} requires missing programs: {', '.join(missing)} "
+            "(use --force to skip this check)"
+        )
+    if missing:
+        warn(f"forcing theme {name} without required programs: {', '.join(missing)}")
+
+
+def stop_rice(data):
+    for process_name in data.get("stop", []):
+        signal_processes(process_name, signal.SIGTERM, "stop")
+
+
+def signal_processes(process_name, signum, action):
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", process_name],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise ThemeError(f"could not find {process_name}: {exc}") from exc
+    if result.returncode == 1:
+        return
+    if result.returncode != 0:
+        detail = (result.stderr or b"").decode(errors="replace").strip()
+        raise ThemeError(
+            f"could not find {process_name}" + (f": {detail}" if detail else "")
+        )
+    for pid_text in result.stdout.decode(errors="replace").split():
+        if not pid_text.isdecimal():
+            raise ThemeError(f"invalid process id for {process_name}: {pid_text!r}")
+        try:
+            pid = int(pid_text)
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise ThemeError(
+                f"could not {action} {process_name} (pid {pid_text}): {exc}"
+            ) from exc
+        if signum == signal.SIGTERM:
+            deadline = time.monotonic() + PROCESS_STOP_TIMEOUT
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                except OSError as exc:
+                    raise ThemeError(
+                        f"could not verify stop of {process_name} (pid {pid_text}): {exc}"
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    raise ThemeError(
+                        f"timed out stopping {process_name} (pid {pid_text})"
+                    )
+                time.sleep(0.05)
+
+
+def start_rice(data):
+    commands = data.get("start", [])
+    if not commands:
+        return
+    log_dir = STATE / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    name = data.get("id", "rice")
+    for index, command in enumerate(commands, start=1):
+        argv = shlex.split(command)
+        log_path = log_dir / f"{name}-{index}.log"
+        try:
+            with log_path.open("ab") as log:
+                subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                    cwd=HOME,
+                )
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            raise ThemeError(f"could not start '{command}': {exc}") from exc
+
+
+def profile(name: str):
+    valid_name(name)
+    root = themes_root().resolve()
+    directory = (root / name).resolve()
+    if not directory.is_relative_to(root):
+        raise ThemeError(f"unsafe theme path: {name}")
+    manifest = directory / MANIFEST_NAME
+    data = read_json(manifest)
+    if not isinstance(data, dict):
+        raise ThemeError(f"theme manifest missing or invalid: {name}")
+    if data.get("format") not in (1, 2):
+        raise ThemeError(f"unsupported theme format: {name}")
+    if data.get("id") != name:
+        raise ThemeError(f"theme id mismatch: {name}")
+    paths = data.get("paths")
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or any(not isinstance(path, str) for path in paths)
+    ):
+        raise ThemeError(f"theme has no paths: {name}")
+
+    extra_paths = validate_extra_paths(data.get("extra_paths", []))
+    validate_tracked_paths(data.get("tracked_paths", []))
+    validate_process_fields(data, name)
+    ensure_no_overlap(paths)
+    for relative in paths:
+        safe_home_path(relative, extra_paths=extra_paths)
+        source = safe_source(directory / "home", relative)
+        if not source.exists():
+            raise ThemeError(f"missing theme content: {relative}")
+        if source.is_dir():
+            validate_tree(source)
+
+    excludes = data.get("excludes", [])
+    if not isinstance(excludes, list):
+        raise ThemeError(f"invalid excludes in theme: {name}")
+    for relative in excludes:
+        safe_home_path(relative, extra_paths=extra_paths)
+        if not any(relative == parent or relative.startswith(parent + "/") for parent in paths):
+            raise ThemeError(f"exclude is outside theme paths: {relative}")
+
+    settings = data.get("settings", {})
+    if not isinstance(settings, dict):
+        raise ThemeError(f"invalid settings in theme: {name}")
+    if set(settings) - set(SETTINGS_FIELDS):
+        raise ThemeError(f"unknown settings fields in theme: {name}")
+    if settings.get("color_scheme") not in VALID_COLOR_SCHEMES:
+        raise ThemeError(f"invalid color_scheme in theme: {name}")
+    for field in ("gtk_theme", "icon_theme", "cursor_theme"):
+        val = settings.get(field)
+        if val is not None and (not isinstance(val, str) or not NAME_RE.match(val)):
+            raise ThemeError(f"invalid {field} in theme: {name}")
+    font = settings.get("gtk_font")
+    if font is not None and (
+        not isinstance(font, str)
+        or not font.strip()
+        or len(font) > 256
+        or any(char in font for char in ("\0", "\n", "\r"))
+    ):
+        raise ThemeError(f"invalid gtk_font in theme: {name}")
+
+    wallpaper = data.get("wallpaper")
+    if wallpaper:
+        if not isinstance(wallpaper, str):
+            raise ThemeError(f"invalid wallpaper path in theme: {name}")
+        if (directory / wallpaper).is_symlink():
+            raise ThemeError(f"wallpaper symlinks are not allowed: {wallpaper}")
+        image = safe_source(directory, wallpaper)
+        if not image.is_file():
+            raise ThemeError(f"wallpaper not found: {wallpaper}")
+        if image.stat().st_size > WALLPAPER_MAX_BYTES:
+            raise ThemeError(f"wallpaper too large: {wallpaper}")
+
+    assets = directory / "assets"
+    if assets.is_dir():
+        validate_tree(assets)
+
+    if extra_paths:
+        warn(f"Rice {name} opts in to extra paths: {', '.join(extra_paths)}")
+
+    return directory, data
+
+
+def ensure_no_overlap(paths):
+    sorted_paths = sorted(paths)
+    for i in range(len(sorted_paths)):
+        for j in range(i + 1, len(sorted_paths)):
+            a, b = sorted_paths[i], sorted_paths[j]
+            if b.startswith(a + "/"):
+                raise ThemeError(
+                    f"overlapping paths in theme: {a} is contained in {b}"
+                )
+
+
+def validate_tree(path: Path, *, reject_links=True):
+    total = 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        if reject_links:
+            for directory in dirs:
+                candidate = Path(root) / directory
+                if candidate.is_symlink():
+                    raise ThemeError(f"symlinks not allowed: {candidate}")
+        for f in files:
+            fp = Path(root) / f
+            if reject_links and fp.is_symlink():
+                raise ThemeError(f"symlinks not allowed: {fp}")
+            total += fp.stat().st_size
+            if total > MAX_THEME_BYTES:
+                raise ThemeError(f"theme exceeds size limit: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Settings (GTK, etc.)
+# ---------------------------------------------------------------------------
+
+def get_settings():
+    """Read current GTK settings, falling back to the live GSettings values."""
+    settings = {}
+    for gtk_ver in ("3.0", "4.0"):
+        ini = HOME / ".config" / f"gtk-{gtk_ver}" / "settings.ini"
+        if ini.is_file():
+            for line in ini.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("gtk-theme-name="):
+                    settings["gtk_theme"] = line.split("=", 1)[1].strip()
+                elif line.startswith("gtk-icon-theme-name="):
+                    settings["icon_theme"] = line.split("=", 1)[1].strip()
+                elif line.startswith("gtk-cursor-theme-name="):
+                    settings["cursor_theme"] = line.split("=", 1)[1].strip()
+                elif line.startswith("gtk-font-name="):
+                    settings["gtk_font"] = line.split("=", 1)[1].strip()
+
+    if shutil.which("gsettings"):
+        keys = {
+            "gtk_theme": "gtk-theme",
+            "icon_theme": "icon-theme",
+            "cursor_theme": "cursor-theme",
+            "gtk_font": "font-name",
+            "color_scheme": "color-scheme",
+        }
+        for field, key in keys.items():
+            if field in settings:
+                continue
+            try:
+                result = subprocess.run(
+                    ["gsettings", "get", "org.gnome.desktop.interface", key],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode:
+                    continue
+                value = ast.literal_eval(result.stdout.strip())
+                if isinstance(value, str):
+                    settings[field] = value
+            except (OSError, SyntaxError, ValueError, subprocess.SubprocessError):
+                continue
+    return settings
+
+
+def apply_settings(values):
+    """Apply GTK settings to settings.ini and the live GSettings backend."""
+    if not values:
+        return
+    gsettings_keys = {
+        "gtk_theme": "gtk-theme",
+        "icon_theme": "icon-theme",
+        "cursor_theme": "cursor-theme",
+        "gtk_font": "font-name",
+        "color_scheme": "color-scheme",
+    }
+    for gtk_ver in ("3.0", "4.0"):
+        ini_dir = HOME / ".config" / f"gtk-{gtk_ver}"
+        ini_dir.mkdir(parents=True, exist_ok=True)
+        ini = ini_dir / "settings.ini"
+        lines = []
+        if ini.is_file():
+            lines = ini.read_text(encoding="utf-8").splitlines()
+        # simple key replace
+        keys = {
+            "gtk-theme-name": values.get("gtk_theme"),
+            "gtk-icon-theme-name": values.get("icon_theme"),
+            "gtk-cursor-theme-name": values.get("cursor_theme"),
+            "gtk-font-name": values.get("gtk_font"),
+        }
+        new_lines = []
+        seen_keys = set()
+        for line in lines:
+            stripped = line.strip()
+            replaced = False
+            for key, val in keys.items():
+                if val is not None and stripped.startswith(f"{key}="):
+                    new_lines.append(f"{key}={val}")
+                    seen_keys.add(key)
+                    replaced = True
+                    break
+            if not replaced:
+                new_lines.append(line)
+        for key, val in keys.items():
+            if val is not None and key not in seen_keys:
+                new_lines.append(f"{key}={val}")
+        ini.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    if shutil.which("gsettings"):
+        for field, key in gsettings_keys.items():
+            value = values.get(field)
+            if value is None:
+                continue
+            try:
+                result = subprocess.run(
+                    ["gsettings", "set", "org.gnome.desktop.interface", key, value],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                warn(f"could not apply GTK setting {field} via gsettings: {exc}")
+                continue
+            if result.returncode:
+                detail = result.stderr.strip() or "gsettings returned an error"
+                warn(f"could not apply GTK setting {field} via gsettings: {detail}")
+
+
+# ---------------------------------------------------------------------------
+# Wallpaper
+# ---------------------------------------------------------------------------
+
+def current_wallpaper():
+    candidates = [
+        HOME / ".config/hypr/wallpaper_effects/.wallpaper_current",
+        HOME / ".config/rofi/.current_wallpaper",
+        HOME / ".wallpaper",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def apply_wallpaper(image_path: Path):
+    if not image_path.is_file():
+        return
+    target = HOME / ".config/hypr/wallpaper_effects/.wallpaper_current"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(image_path, target)
+    # Try wallust if available
+    if shutil.which("wallust"):
+        try:
+            subprocess.run(["wallust", "run", str(target)], check=False,
+                           capture_output=True, timeout=30)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Reload adapters
+# ---------------------------------------------------------------------------
+
+def reload_apps(paths):
+    """Reload applications affected by changed config paths."""
+    if any(
+        p in (".fonts", ".local/share/fonts")
+        or p.startswith(".local/share/fonts/")
+        or p.startswith(".config/fontconfig")
+        for p in paths
+    ):
+        try:
+            result = subprocess.run(
+                ["fc-cache", "-f"], check=False, capture_output=True, timeout=30
+            )
+            if result.returncode:
+                warn("font cache refresh failed")
+        except (subprocess.SubprocessError, OSError):
+            warn("could not refresh the font cache")
+    if any(p.startswith(".config/hypr") for p in paths):
+        try:
+            result = subprocess.run(
+                ["hyprctl", "reload"], check=False, capture_output=True, timeout=15
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise ThemeError(f"could not reload Hyprland: {exc}") from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout or b"").decode(
+                errors="replace"
+            ).strip()
+            raise ThemeError(
+                "Hyprland reload failed" + (f": {detail}" if detail else "")
+            )
+        try:
+            result = subprocess.run(
+                ["hyprctl", "configerrors"],
+                check=False,
+                capture_output=True,
+                timeout=15,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise ThemeError(f"could not verify the Hyprland config: {exc}") from exc
+        detail = "\n".join(
+            part.decode(errors="replace").strip()
+            for part in (result.stdout, result.stderr)
+            if part
+        ).strip()
+        if result.returncode or any(
+            line.strip()
+            and not any(
+                marker in line.lower()
+                for marker in ("no config errors", "no errors found", "no errors")
+            )
+            for line in detail.splitlines()
+        ):
+            raise ThemeError(
+                "Hyprland configuration reported errors"
+                + (f": {detail}" if detail else "")
+            )
+    if any(p == ".config/waybar" for p in paths):
+        signal_processes("waybar", signal.SIGUSR1, "reload")
+    if any(p == ".config/swaync" for p in paths):
+        signal_processes("swaync", signal.SIGUSR1, "reload")
+    if any(p == ".config/quickshell" for p in paths):
+        signal_processes("quickshell", signal.SIGUSR1, "reload")
+    if any(p == ".config/kitty" for p in paths):
+        signal_processes("kitty", signal.SIGUSR1, "reload")
+    if any(p == ".config/rofi" for p in paths):
+        pass  # rofi is stateless per-invocation
+
+# ---------------------------------------------------------------------------
+# Snapshot / restore
+# ---------------------------------------------------------------------------
+
+def snapshot_item(source: Path, destination: Path):
+    """Copy source to destination, return metadata dict."""
+    if source.is_symlink():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
+        return {"kind": "symlink"}
+    if not source.exists():
+        return {"kind": "missing"}
+    if source.is_dir():
+        copy_tree(source, destination, reject_links=False)
+        return {"kind": "dir"}
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return {"kind": "file", "size": source.stat().st_size,
+                "mtime": source.stat().st_mtime}
+
+
+def restore_item(destination: Path, snapshot: Path, meta: dict):
+    """Restore an item from snapshot to destination."""
+    kind = meta.get("kind")
+    remove_path(destination)
+    if kind == "missing":
+        return
+    if kind not in ("dir", "file", "symlink") or not (
+        snapshot.exists() or snapshot.is_symlink()
+    ):
+        return
+    copy_tree(snapshot, destination, reject_links=False)
+
+
+# ---------------------------------------------------------------------------
+# Core operations
+# ---------------------------------------------------------------------------
+
+def baseline_for(paths, *, extra_paths=()):
+    """Build a baseline snapshot of current home paths."""
+    result = {
+        "version": 2,
+        "paths": {},
+        "settings": get_settings(),
+        "wallpaper": None,
+        "extra_paths": list(validate_extra_paths(list(extra_paths))),
+    }
+    wp = current_wallpaper()
+    if wp:
+        result["wallpaper"] = str(wp)
+    for relative in paths:
+        target = safe_home_path(relative, extra_paths=extra_paths)
+        key = path_key(relative)
+        snapshot = STATE / "baseline-files" / key
+        meta = snapshot_item(target, snapshot)
+        result["paths"][relative] = {"snapshot": key, **meta}
+    return result
+
+
+def ensure_baseline(paths, *, extra_paths=()):
+    """Keep the original contents of every controlled path across theme switches."""
+    baseline = read_json(STATE / "baseline.json")
+    if not isinstance(baseline, dict) or not isinstance(baseline.get("paths"), dict):
+        baseline = {"version": 2, "paths": {}, "settings": get_settings(), "wallpaper": None}
+
+    changed = baseline.get("version") != 2
+    baseline["version"] = 2
+    known_extra_paths = validate_extra_paths(baseline.get("extra_paths", []))
+    combined_extra_paths = tuple(dict.fromkeys((*known_extra_paths, *extra_paths)))
+    if list(combined_extra_paths) != baseline.get("extra_paths", []):
+        baseline["extra_paths"] = list(combined_extra_paths)
+        changed = True
+    for relative in paths:
+        entry = baseline["paths"].get(relative)
+        key = path_key(relative)
+        snapshot = STATE / "baseline-files" / key
+        if (
+            isinstance(entry, dict)
+            and entry.get("snapshot") == key
+            and (snapshot.exists() or snapshot.is_symlink() or entry.get("kind") == "missing")
+        ):
+            continue
+        meta = snapshot_item(
+            safe_home_path(relative, extra_paths=combined_extra_paths), snapshot
+        )
+        baseline["paths"][relative] = {"snapshot": key, **meta}
+        changed = True
+
+    if not isinstance(baseline.get("settings"), dict):
+        baseline["settings"] = get_settings()
+        changed = True
+    elif "gtk_font" not in baseline["settings"]:
+        current_font = get_settings().get("gtk_font")
+        if current_font is not None:
+            baseline["settings"]["gtk_font"] = current_font
+            changed = True
+    if "wallpaper" not in baseline:
+        baseline["wallpaper"] = None
+        changed = True
+    if "wallpaper_snapshot" not in baseline:
+        wallpaper = current_wallpaper()
+        if wallpaper and wallpaper.is_file() and wallpaper.stat().st_size <= WALLPAPER_MAX_BYTES:
+            snapshot = STATE / "baseline-files" / "wallpaper"
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(wallpaper, snapshot)
+            baseline["wallpaper_snapshot"] = "wallpaper"
+        else:
+            baseline["wallpaper_snapshot"] = None
+        changed = True
+    if changed:
+        atomic_json(STATE / "baseline.json", baseline)
+    return baseline
+
+
+def preserve_gtk_font(source: Path, target: Path, font):
+    """Merge a profile's GTK settings while retaining the user's font setting."""
+    if font is None:
+        return
+    source_lines = (
+        source.read_text(encoding="utf-8").splitlines()
+        if source.is_file()
+        else target.read_text(encoding="utf-8").splitlines()
+        if target.is_file()
+        else []
+    )
+    merged = []
+    found = False
+    for line in source_lines:
+        if line.strip().startswith("gtk-font-name="):
+            merged.append(f"gtk-font-name={font}")
+            found = True
+        else:
+            merged.append(line)
+    if not found:
+        merged.append(f"gtk-font-name={font}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(merged) + "\n", encoding="utf-8")
+
+
+def preserve_kitty_fonts(source: Path, target: Path, original: Path | None):
+    """Keep the user's Kitty font and symbol-map directives over Rice colors."""
+    if original is None or not original.is_file():
+        return
+    pattern = re.compile(r"^\s*([A-Za-z_]+)\s+")
+    user_lines = []
+    for line in original.read_text(encoding="utf-8").splitlines():
+        match = pattern.match(line)
+        if match and match.group(1) in KITTY_FONT_KEYS:
+            user_lines.append(line)
+    if not user_lines:
+        return
+    source_lines = (
+        source.read_text(encoding="utf-8").splitlines()
+        if source.is_file()
+        else target.read_text(encoding="utf-8").splitlines()
+        if target.is_file()
+        else []
+    )
+    merged = []
+    for line in source_lines:
+        match = pattern.match(line)
+        if not match or match.group(1) not in KITTY_FONT_KEYS:
+            merged.append(line)
+    merged.extend(user_lines)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(merged) + "\n", encoding="utf-8")
+
+
+def replace_with_symlink(target: Path, source: Path):
+    """Switch a home path to a profile-owned path, preserving rollback safety."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name(f".{target.name}.theme-{os.getpid()}-{uuid.uuid4().hex}")
+    previous = target.with_name(f".{target.name}.previous-{os.getpid()}-{uuid.uuid4().hex}")
+    staged.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+    try:
+        if target.exists() or target.is_symlink():
+            os.replace(target, previous)
+        os.replace(staged, target)
+    except Exception:
+        if previous.exists() or previous.is_symlink():
+            os.replace(previous, target)
+        raise
+    finally:
+        if staged.exists() or staged.is_symlink():
+            remove_path(staged)
+    remove_path(previous)
+
+
+def apply_profile(name, *, dry_run=False, run_health_check=True, force=False):
+    directory, data = profile(name)
+    check_requirements(name, data, force=force)
+    active = read_json(STATE / "active.json")
+    old_data = {}
+    if isinstance(active, dict) and active.get("profile"):
+        _, old_data = profile(active["profile"])
+    old_paths = active.get("paths", []) if isinstance(active, dict) else []
+    excludes = protected_paths(data)
+    new_paths = [p for p in data.get("paths", []) if p not in excludes]
+    all_paths = list(dict.fromkeys(old_paths + new_paths))
+    all_extra_paths = tuple(dict.fromkeys(
+        (*validate_extra_paths(old_data.get("extra_paths", [])),
+         *validate_extra_paths(data.get("extra_paths", [])))
+    ))
+    for relative in all_paths:
+        safe_home_path(relative, extra_paths=all_extra_paths)
+    ensure_no_overlap(all_paths)
+    total_size = sum(
+        dir_size(safe_source(directory / "home", relative))
+        for relative in new_paths
+    )
+    if total_size > MAX_THEME_BYTES:
+        raise ThemeError(f"theme exceeds size limit: {total_size / (1024 * 1024):.1f} MB")
+
+    if dry_run:
+        info(f"[dry-run] Would switch Rice: {data.get('name', name)}")
+        info(f"  paths to replace: {', '.join(new_paths)}")
+        if excludes:
+            info(f"  protected: {', '.join(sorted(excludes))}")
+        info(f"  stop: {', '.join(old_data.get('stop', [])) or '(none)'}")
+        info(f"  start: {'; '.join(data.get('start', [])) or '(none)'}")
+        return
+
+    ensure_state_dirs()
+    lock_fd = os.open(STATE / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        transaction = STATE / "backups" / f"pre-{name}-{now_ts()}-{uuid.uuid4().hex[:8]}"
+        transaction.mkdir(parents=True)
+        runtime = {}
+        for relative in all_paths:
+            runtime[relative] = snapshot_item(
+                safe_home_path(relative, extra_paths=all_extra_paths),
+                transaction / path_key(relative),
+            )
+        old_wallpaper = current_wallpaper()
+        has_wallpaper_snapshot = bool(
+            old_wallpaper
+            and old_wallpaper.is_file()
+            and old_wallpaper.stat().st_size <= WALLPAPER_MAX_BYTES
+        )
+        if has_wallpaper_snapshot:
+            shutil.copy2(old_wallpaper, transaction / "wallpaper")
+        excluded_runtime = {}
+        for excluded in excludes:
+            snap = transaction / f"excluded-{path_key(excluded)}"
+            excluded_runtime[excluded] = (
+                snapshot_item(
+                    safe_home_path(excluded, extra_paths=all_extra_paths), snap
+                ),
+                snap,
+            )
+        prior_active = read_json(STATE / "active.json")
+        prior_baseline = read_json(STATE / "baseline.json")
+        runtime_settings = get_settings()
+        prior_state = {
+            "active": prior_active,
+            "baseline": prior_baseline,
+            "settings": runtime_settings,
+            "paths": all_paths,
+            "extra_paths": list(all_extra_paths),
+            "snapshots": runtime,
+            "wallpaper": str(old_wallpaper) if old_wallpaper else None,
+            "wallpaper_snapshot": has_wallpaper_snapshot,
+        }
+        atomic_json(transaction / "state.json", prior_state)
+
+        lifecycle_started = False
+        try:
+            baseline = ensure_baseline(all_paths, extra_paths=all_extra_paths)
+            for relative in all_paths:
+                entry = baseline["paths"][relative]
+                restore_item(
+                    safe_home_path(relative, extra_paths=all_extra_paths),
+                    STATE / "baseline-files" / entry["snapshot"],
+                    entry,
+                )
+
+            for relative in new_paths:
+                source = safe_source(directory / "home", relative)
+                target = safe_home_path(relative, extra_paths=all_extra_paths)
+                child_excludes = {
+                    excluded for excluded in excludes
+                    if excluded.startswith(relative + "/")
+                }
+                if child_excludes:
+                    view_root = directory / ".runtime" / "home"
+                    view = view_root / relative
+                    remove_path(view)
+                    copy_entry(source, view, excludes=child_excludes, rel_base=target)
+                    for excluded in child_excludes:
+                        inner = PurePosixPath(excluded[len(relative) + 1:])
+                        meta, saved = excluded_runtime[excluded]
+                        if meta.get("kind") != "missing":
+                            copy_tree(saved, view / inner, reject_links=False)
+                        if excluded in GTK_FONT_PATHS:
+                            preserve_gtk_font(
+                                directory / "home" / excluded,
+                                view / inner,
+                                baseline.get("settings", {}).get("gtk_font")
+                                or runtime_settings.get("gtk_font"),
+                            )
+                        elif excluded == KITTY_CONFIG_PATH:
+                            preserve_kitty_fonts(
+                                directory / "home" / excluded,
+                                view / inner,
+                                saved if meta.get("kind") != "missing" else None,
+                            )
+                    source = view
+                else:
+                    validate_tree(source, reject_links=False)
+                replace_with_symlink(target, source)
+
+            settings = dict(baseline.get("settings", {}))
+            settings.update(data.get("settings", {}))
+            user_font = (
+                baseline.get("settings", {}).get("gtk_font")
+                or runtime_settings.get("gtk_font")
+            )
+            if user_font is not None:
+                settings["gtk_font"] = user_font
+            apply_settings(settings)
+            wallpaper = data.get("wallpaper")
+            if wallpaper:
+                apply_wallpaper(safe_source(directory, wallpaper))
+            elif baseline.get("wallpaper_snapshot"):
+                apply_wallpaper(
+                    STATE / "baseline-files" / baseline["wallpaper_snapshot"]
+                )
+
+            reload_apps(new_paths)
+            lifecycle_started = True
+            stop_rice(old_data)
+            start_rice(data)
+
+            for command in data.get("post_apply", []):
+                try:
+                    subprocess.run(
+                        command.split(), check=False, capture_output=True, timeout=30
+                    )
+                except (subprocess.SubprocessError, OSError):
+                    warn(f"post-apply command failed: {command}")
+
+            if run_health_check:
+                time.sleep(HEALTH_CHECK_WAIT)
+                for command in data.get("health_check", ["hyprctl monitors"]):
+                    result = subprocess.run(
+                        command.split(), check=False, capture_output=True, timeout=15
+                    )
+                    if result.returncode:
+                        raise ThemeError(f"health check failed: {command}")
+
+            state = {
+                "profile": name,
+                "name": data.get("name", name),
+                "paths": new_paths,
+                "excludes": sorted(excludes),
+                "extra_paths": list(validate_extra_paths(data.get("extra_paths", []))),
+            }
+            atomic_json(STATE / "active.json", state)
+            info(f"Switched Rice: {data.get('name', name)}")
+            if excludes:
+                info(f"Protected (unchanged): {', '.join(sorted(excludes))}")
+        except Exception as failure:
+            rollback_errors = []
+            if lifecycle_started:
+                try:
+                    stop_rice(data)
+                except Exception as exc:
+                    rollback_errors.append(str(exc))
+            for relative in all_paths:
+                try:
+                    restore_item(
+                        safe_home_path(relative, extra_paths=all_extra_paths),
+                        transaction / path_key(relative),
+                        runtime[relative],
+                    )
+                except Exception as exc:
+                    rollback_errors.append(str(exc))
+            try:
+                apply_settings(prior_state["settings"])
+                if has_wallpaper_snapshot:
+                    apply_wallpaper(transaction / "wallpaper")
+                if prior_active is None:
+                    (STATE / "active.json").unlink(missing_ok=True)
+                else:
+                    atomic_json(STATE / "active.json", prior_active)
+                if prior_baseline is None:
+                    (STATE / "baseline.json").unlink(missing_ok=True)
+                else:
+                    atomic_json(STATE / "baseline.json", prior_baseline)
+            except Exception as exc:
+                rollback_errors.append(str(exc))
+            for operation in (
+                lambda: reload_apps(all_paths),
+                lambda: stop_rice(old_data),
+                lambda: start_rice(old_data),
+            ):
+                try:
+                    operation()
+                except Exception as exc:
+                    rollback_errors.append(str(exc))
+            if rollback_errors:
+                raise ThemeError(
+                    f"{failure}; rollback had errors: {'; '.join(rollback_errors)}"
+                ) from failure
+            raise
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def use_theme(name, *, force=False):
+    """Apply a theme and run the configured health checks."""
+    manifest = themes_root() / name / MANIFEST_NAME
+    if name == "current" and not manifest.is_file():
+        restore_baseline()
+        return
+    apply_profile(name, force=force)
+
+
+def restore_baseline():
+    baseline = read_json(STATE / "baseline.json")
+    if not isinstance(baseline, dict) or baseline.get("version") != 2:
+        raise ThemeError("no restorable baseline is available")
+    active = read_json(STATE / "active.json")
+    active_data = {}
+    if isinstance(active, dict) and active.get("profile"):
+        _, active_data = profile(active["profile"])
+    extra_paths = tuple(dict.fromkeys(
+        (*validate_extra_paths(baseline.get("extra_paths", [])),
+         *validate_extra_paths(active_data.get("extra_paths", [])))
+    ))
+    paths = list(dict.fromkeys(
+        (active.get("paths", []) if isinstance(active, dict) else [])
+        + list(baseline.get("paths", {}).keys())
+    ))
+    try:
+        for relative in paths:
+            entry = baseline.get("paths", {}).get(relative)
+            if not isinstance(entry, dict):
+                continue
+            restore_item(
+                safe_home_path(relative, extra_paths=extra_paths),
+                STATE / "baseline-files" / entry.get("snapshot", path_key(relative)),
+                entry,
+            )
+        apply_settings(baseline.get("settings", {}))
+        wallpaper_snapshot = baseline.get("wallpaper_snapshot")
+        if wallpaper_snapshot:
+            apply_wallpaper(STATE / "baseline-files" / wallpaper_snapshot)
+        reload_apps(paths)
+        stop_rice(active_data)
+        (STATE / "active.json").unlink(missing_ok=True)
+        info("Restored original settings.")
+    except Exception:
+        try:
+            stop_rice(active_data)
+            start_rice(active_data)
+        except Exception as start_error:
+            warn(f"could not restart previous theme processes: {start_error}")
+        raise
+
+
+def wallpaper_copy(destination: Path):
+    wp = current_wallpaper()
+    if wp and wp.stat().st_size <= WALLPAPER_MAX_BYTES:
+        shutil.copy2(wp, destination)
+        return str(wp)
+    return None
+
+
+def cmd_list(args):
+    profiles = list_profiles()
+    if getattr(args, "json", False):
+        output = []
+        for profile in profiles:
+            settings = profile.get("settings", {})
+            if not isinstance(settings, dict):
+                settings = {}
+            output.append({
+                "themeId": profile["id"],
+                "themeName": profile.get("name", ""),
+                "kind": "profile",
+                "colorScheme": settings.get("color_scheme") or "",
+            })
+        print(json.dumps(output, ensure_ascii=False))
+        return
+    if not profiles:
+        info("No Rice profiles installed.")
+        return
+    info("Installed Rice profiles:")
+    for p in profiles:
+        marker = ""
+        active = read_json(STATE / "active.json")
+        if active and active.get("profile") == p["id"]:
+            marker = "  (active)"
+        info(f"  {p['id']}\t{p.get('name', '')}{marker}")
+
+
+def cmd_status(_args):
+    active = read_json(STATE / "active.json")
+    if not active:
+        info("No Rice profile active yet.")
+        return
+    info(f"Active Rice: {active.get('profile')} ({active.get('name', '')})")
+    info(f"Paths: {', '.join(active.get('paths', []))}")
+    baseline = read_json(STATE / "baseline.json")
+    if baseline:
+        info(f"Settings: {baseline.get('settings', {})}")
+
+
+def cmd_preview(args):
+    directory, data = profile(args.name)
+    info(f"Rice: {data.get('name', args.name)} ({args.name})")
+    info(f"Description: {data.get('description', '(none)')}")
+    excludes = protected_paths(data)
+    new_paths = [path for path in data.get("paths", []) if path not in excludes]
+    info(f"Paths to replace: {', '.join(new_paths)}")
+    info(f"Requires: {', '.join(data.get('requires', [])) or '(none)'}")
+    info(f"Stop: {', '.join(data.get('stop', [])) or '(none)'}")
+    info(f"Start: {'; '.join(data.get('start', [])) or '(none)'}")
+    if data.get("extra_paths"):
+        info(f"Extra paths: {', '.join(data['extra_paths'])}")
+    if excludes:
+        info(f"Excluded: {', '.join(sorted(excludes))}")
+    if data.get("settings"):
+        info(f"Settings: {data['settings']}")
+    if data.get("wallpaper"):
+        info(f"Wallpaper: {data['wallpaper']}")
+    if data.get("post_apply"):
+        info(f"Post-apply: {', '.join(data['post_apply'])}")
+    # Show diff against current
+    active = read_json(STATE / "active.json")
+    old_paths = active.get("paths", []) if active else []
+    added = sorted(set(new_paths) - set(old_paths))
+    removed = sorted(set(old_paths) - set(new_paths))
+    common = sorted(set(new_paths) & set(old_paths))
+    if added:
+        info(f"Would add: {', '.join(added)}")
+    if removed:
+        info(f"Would remove: {', '.join(removed)}")
+    if common:
+        info(f"Would replace: {', '.join(common)}")
+
+
+def tracked_state_path(relative):
+    if relative not in validate_tracked_paths([relative]):
+        raise ThemeError(f"untracked Rice state path: {relative}")
+    target = HOME / relative
+    if not target.resolve(strict=False).is_relative_to(HOME.resolve(strict=False)):
+        raise ThemeError(f"Rice state path escapes home: {relative}")
+    for parent in target.parents:
+        if parent == HOME:
+            break
+        if parent.is_symlink():
+            raise ThemeError(f"Rice state path crosses a symlink: {relative}")
+    return target
+
+
+def _iter_profile_files(root):
+    if not root.is_dir() or root.is_symlink():
+        return
+    for child in sorted(root.iterdir()):
+        if child.is_symlink() or child.is_file():
+            yield child
+        elif child.is_dir():
+            yield from _iter_profile_files(child)
+
+
+def _profile_change_entries(directory, data):
+    entries = {}
+    for area in ("home", "assets"):
+        root = directory / area
+        for path in _iter_profile_files(root):
+            entries[f"{area}/{path.relative_to(root).as_posix()}"] = path
+    for relative in validate_tracked_paths(data.get("tracked_paths", [])):
+        path = tracked_state_path(relative)
+        if path.exists() or path.is_symlink():
+            entries[f"external/{relative}"] = path
+    return entries
+
+
+def _profile_entry_signature(path):
+    if path.is_symlink():
+        return {
+            "kind": "symlink",
+            "target": os.readlink(path),
+            "mode": path.lstat().st_mode & 0o7777,
+        }
+    if path.is_file():
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return {
+            "kind": "file",
+            "sha256": digest.hexdigest(),
+            "mode": path.stat().st_mode & 0o7777,
+        }
+    raise ThemeError(f"unsupported Rice change entry: {path}")
+
+
+def _history_path(history, kind, key):
+    parts = PurePosixPath(key).parts
+    if kind == "" and parts and parts[0] == "versions":
+        if (
+            PurePosixPath(key).is_absolute()
+            or "\\" in key
+            or ".." in parts
+        ):
+            raise ThemeError(f"invalid Rice history snapshot: {key}")
+        return history / Path(*parts)
+    if (
+        not parts
+        or PurePosixPath(key).is_absolute()
+        or "\\" in key
+        or ".." in parts
+        or parts[0] not in ("home", "assets", "external")
+    ):
+        raise ThemeError(f"invalid Rice history path: {key}")
+    return history / kind / Path(*parts)
+
+
+def _change_target(directory, data, key):
+    parts = PurePosixPath(key).parts
+    _history_path(directory / ".history", "current", key)
+    if parts[0] == "external":
+        relative = "/".join(parts[1:])
+        if relative not in validate_tracked_paths(data.get("tracked_paths", [])):
+            raise ThemeError(f"untracked Rice state path: {relative}")
+        return tracked_state_path(relative)
+
+    relative = Path(*parts[1:])
+    if not parts[1:]:
+        raise ThemeError(f"invalid Rice history path: {key}")
+    root = directory / parts[0]
+    target = root / relative
+    for parent in target.parents:
+        if parent == root:
+            break
+        if parent.is_symlink():
+            raise ThemeError(f"Rice history path crosses a symlink: {key}")
+    if not target.parent.resolve(strict=False).is_relative_to(
+        root.resolve(strict=False)
+    ):
+        raise ThemeError(f"Rice history path escapes its profile: {key}")
+    return target
+
+
+def _replace_history_entry(source, target):
+    if not (source.exists() or source.is_symlink()):
+        remove_path(target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        copy_tree(source, staged, reject_links=False)
+        remove_path(target)
+        os.replace(staged, target)
+    finally:
+        remove_path(staged)
+
+
+def _remove_empty_profile_parents(target, root):
+    parent = target.parent
+    while parent != root and parent.is_relative_to(root):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def initialize_profile_history(directory, data):
+    """Record the profile and opted-in runtime state as the initial version."""
+    history = directory / ".history"
+    if history.exists():
+        index = read_json(history / "index.json")
+        events = read_json(history / "events.json")
+        if (
+            history.is_dir()
+            and isinstance(index, dict)
+            and index.get("version") == 1
+            and isinstance(index.get("files"), dict)
+            and isinstance(events, list)
+        ):
+            return
+        raise ThemeError(f"invalid change history for Rice: {data.get('id')}")
+
+    staged = Path(tempfile.mkdtemp(prefix=".history-", dir=directory))
+    try:
+        current = staged / "current"
+        for area in ("home", "assets"):
+            source = directory / area
+            if source.is_dir():
+                copy_tree(source, current / area, reject_links=False)
+        for relative in validate_tracked_paths(data.get("tracked_paths", [])):
+            source = tracked_state_path(relative)
+            if source.exists() or source.is_symlink():
+                copy_tree(
+                    source,
+                    current / "external" / relative,
+                    reject_links=False,
+                )
+        signatures = {
+            key: _profile_entry_signature(path)
+            for key, path in _profile_change_entries(directory, data).items()
+        }
+        atomic_json(staged / "index.json", {"version": 1, "files": signatures})
+        atomic_json(staged / "events.json", [])
+        staged.rename(history)
+    except Exception:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+
+
+def collect_profile_changes(name):
+    """Record file changes since the last inspection and return their history."""
+    directory, data = profile(name)
+    initialize_profile_history(directory, data)
+    history = directory / ".history"
+    index = read_json(history / "index.json")
+    events = read_json(history / "events.json")
+    if not isinstance(index, dict) or not isinstance(index.get("files"), dict):
+        raise ThemeError(f"invalid change history for Rice: {name}")
+    if not isinstance(events, list):
+        raise ThemeError(f"invalid change list for Rice: {name}")
+
+    previous_files = index["files"]
+    current_entries = _profile_change_entries(directory, data)
+    current_files = {
+        key: _profile_entry_signature(path)
+        for key, path in current_entries.items()
+    }
+
+    for key in sorted(set(previous_files) | set(current_files)):
+        before_signature = previous_files.get(key)
+        after_signature = current_files.get(key)
+        if before_signature == after_signature:
+            continue
+
+        change_id = uuid.uuid4().hex
+        version_dir = history / "versions" / change_id
+        before = {"kind": before_signature["kind"] if before_signature else "missing"}
+        after = {"kind": after_signature["kind"] if after_signature else "missing"}
+        before_path = _history_path(history, "current", key)
+        after_path = current_entries.get(key)
+        if before_signature:
+            before["snapshot"] = f"versions/{change_id}/before"
+            copy_tree(before_path, version_dir / "before", reject_links=False)
+        if after_signature:
+            after["snapshot"] = f"versions/{change_id}/after"
+            copy_tree(after_path, version_dir / "after", reject_links=False)
+
+        if before_signature is None:
+            status = "added"
+        elif after_signature is None:
+            status = "deleted"
+        else:
+            status = "modified"
+        events.append({
+            "id": change_id,
+            "path": key,
+            "status": status,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "before": before,
+            "after": after,
+            "restored": False,
+        })
+
+        current_path = _history_path(history, "current", key)
+        if after_signature:
+            _replace_history_entry(after_path, current_path)
+            previous_files[key] = after_signature
+        else:
+            remove_path(current_path)
+            _remove_empty_profile_parents(current_path, history / "current")
+            previous_files.pop(key, None)
+
+    atomic_json(history / "events.json", events)
+    atomic_json(history / "index.json", index)
+    return events
+
+
+def _history_change_diff(directory, change):
+    history = directory / ".history"
+
+    def content(version, side):
+        if version.get("kind") == "missing":
+            return ["(missing)"]
+        snapshot = version.get("snapshot")
+        if not isinstance(snapshot, str):
+            return ["(snapshot unavailable)"]
+        path = history / snapshot
+        if not path.is_file() or path.is_symlink():
+            return [f"(non-text {version['kind']})"]
+        try:
+            if path.stat().st_size > 64 * 1024:
+                return ["(file is larger than the text preview limit)"]
+            return path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return ["(binary or unreadable file)"]
+
+    return list(difflib.unified_diff(
+        content(change["before"], "before"),
+        content(change["after"], "after"),
+        fromfile="before",
+        tofile="after",
+        lineterm="",
+    ))
+
+
+def restore_profile_change(name, change_id):
+    """Restore one profile file to the version immediately before a recorded edit."""
+    directory, data = profile(name)
+    events = collect_profile_changes(name)
+    change = next((item for item in events if item.get("id") == change_id), None)
+    if change is None:
+        raise ThemeError(f"change not found for Rice {name}: {change_id}")
+
+    history = directory / ".history"
+    before = change.get("before")
+    if not isinstance(before, dict) or before.get("kind") not in (
+        "missing", "file", "symlink"
+    ):
+        raise ThemeError(f"invalid previous version for Rice change: {change_id}")
+    snapshot = None
+    if before["kind"] != "missing":
+        snapshot_rel = before.get("snapshot")
+        if not isinstance(snapshot_rel, str):
+            raise ThemeError(f"previous version snapshot is missing: {change_id}")
+        snapshot = _history_path(history, "", snapshot_rel)
+        if not (snapshot.is_file() or snapshot.is_symlink()):
+            raise ThemeError(f"previous version snapshot is missing: {change_id}")
+
+    key = change.get("path")
+    target = _change_target(directory, data, key)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".restore-", dir=target.parent))
+    saved = temporary / "current"
+    saved_signature = (
+        _profile_entry_signature(target)
+        if target.is_file() or target.is_symlink()
+        else None
+    )
+    if saved_signature:
+        copy_tree(target, saved, reject_links=False)
+
+    active = read_json(STATE / "active.json")
+    is_active = isinstance(active, dict) and active.get("profile") == name
+    affected_paths = []
+    if is_active and key.startswith("home/"):
+        changed_path = key[len("home/"):]
+        affected_paths = [
+            path for path in data.get("paths", [])
+            if changed_path == path or changed_path.startswith(path + "/")
+        ]
+    old_wallpaper = current_wallpaper() if is_active else None
+
+    try:
+        if before["kind"] == "missing":
+            remove_path(target)
+            _remove_empty_profile_parents(
+                target,
+                directory / key.split("/", 1)[0],
+            )
+        else:
+            _replace_history_entry(snapshot, target)
+
+        if is_active:
+            if affected_paths:
+                reload_apps(affected_paths)
+            if key.startswith("assets/") and data.get("wallpaper") == key:
+                apply_wallpaper(safe_source(directory, data["wallpaper"]))
+
+        current_path = _history_path(history, "current", key)
+        index = read_json(history / "index.json")
+        history_events = read_json(history / "events.json")
+        if not isinstance(index, dict) or not isinstance(index.get("files"), dict):
+            raise ThemeError(f"invalid change history for Rice: {name}")
+        if not isinstance(history_events, list):
+            raise ThemeError(f"invalid change list for Rice: {name}")
+        if before["kind"] == "missing":
+            remove_path(current_path)
+            _remove_empty_profile_parents(current_path, history / "current")
+            index["files"].pop(key, None)
+        else:
+            _replace_history_entry(snapshot, current_path)
+            index["files"][key] = _profile_entry_signature(current_path)
+        for item in history_events:
+            if item.get("id") == change_id:
+                item["restored"] = True
+                item["restored_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                break
+        atomic_json(history / "events.json", history_events)
+        atomic_json(history / "index.json", index)
+    except Exception as failure:
+        rollback_errors = []
+        try:
+            if saved_signature:
+                _replace_history_entry(saved, target)
+            else:
+                remove_path(target)
+            if is_active:
+                if affected_paths:
+                    reload_apps(affected_paths)
+                if old_wallpaper:
+                    apply_wallpaper(old_wallpaper)
+        except Exception as rollback_error:
+            rollback_errors.append(str(rollback_error))
+        if rollback_errors:
+            raise ThemeError(
+                f"{failure}; rollback had errors: {'; '.join(rollback_errors)}"
+            ) from failure
+        raise
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+    info(f"Restored {key} to the version before change {change_id[:8]}.")
+
+
+def cmd_capture(args):
+    name = args.name or "current"
+    valid_name(name)
+    root = themes_root()
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / name
+    if destination.exists():
+        die(f"Rice already exists: {name}")
+
+    staged = Path(tempfile.mkdtemp(prefix=f".{name}-", dir=root))
+    copied = []
+    try:
+        # Collect current paths
+        CURRENT_PATHS = (
+            ".config/hypr", ".config/waybar", ".config/kitty", ".config/rofi",
+            ".config/swaync", ".config/quickshell", ".config/rumda",
+            ".config/illogical-impulse", ".config/gtk-3.0", ".config/gtk-4.0",
+            ".config/gtk-2.0", ".config/fontconfig", ".config/qt5ct",
+            ".config/qt6ct", ".config/Kvantum", ".config/dunst",
+            ".config/mako", ".config/hyprlock", ".config/hypridle",
+            ".config/hyprpaper", ".config/hyprsunset", ".config/wlogout",
+            ".config/cava", ".config/btop", ".config/mpv", ".config/wofi",
+            ".config/fuzzel", ".config/alacritty", ".config/ghostty",
+            ".config/foot", ".config/starship.toml", ".config/kdeglobals",
+            ".config/kwinrc", ".config/plasmarc",
+            ".config/plasma-org.kde.plasma.desktop-appletsrc",
+            ".themes", ".icons", ".fonts", ".local/share/fonts",
+            ".local/share/icons", ".local/share/themes",
+            ".local/share/backgrounds", ".local/share/color-schemes",
+            ".local/share/konsole", ".local/share/plasma",
+            ".local/share/kwin", ".local/share/wallpapers",
+            ".local/share/aurorae",
+            *ALLOWED_HOME_FILES,
+        )
+        for relative in CURRENT_PATHS:
+            source = safe_home_path(relative)
+            if source.exists():
+                copy_tree(source.resolve(), staged / "home" / relative)
+                copied.append(relative)
+        if not copied:
+            shutil.rmtree(staged, ignore_errors=True)
+            die("no current appearance settings found to capture.")
+        if sum(dir_size(staged / "home" / path) for path in copied) > MAX_THEME_BYTES:
+            raise ThemeError("captured appearance exceeds the theme size limit.")
+
+        wallpaper = current_wallpaper()
+        wallpaper_rel = None
+        if wallpaper and wallpaper.stat().st_size <= WALLPAPER_MAX_BYTES:
+            asset = staged / "assets" / f"wallpaper{wallpaper.suffix.lower()}"
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(wallpaper, asset)
+            wallpaper_rel = asset.relative_to(staged).as_posix()
+
+        manifest = {
+            "format": 2,
+            "id": name,
+            "name": name,
+            "description": f"Captured current appearance on {time.strftime('%Y-%m-%d %H:%M:%S')}.",
+            "paths": copied,
+            "settings": get_settings(),
+        }
+        if wallpaper_rel:
+            manifest["wallpaper"] = wallpaper_rel
+
+        atomic_json(staged / MANIFEST_NAME, manifest)
+        initialize_profile_history(staged, manifest)
+        staged.rename(destination)
+        info(f"Captured current setup as Rice: {name}")
+    except Exception:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+
+
+def discover_repository(source):
+    """Find appearance configs and assets in common dotfiles layouts."""
+    found = {}
+    source = Path(source).resolve()
+
+    def add(target, path, *, extra_paths=()):
+        try:
+            safe_home_path(target, extra_paths=extra_paths)
+        except ThemeError:
+            return
+        if path.is_dir() or path.is_file():
+            found[target] = path
+
+    # Common layouts
+    for relative in (".config", "config", "home/.config", "dotfiles/.config"):
+        base = source / relative
+        if base.is_dir():
+            for app in sorted(base.iterdir()):
+                if app.name.lower() in DENIED_CONFIG_DIRS:
+                    continue
+                target = f".config/{app.name}"
+                add(target, app)
+    # Top-level app dirs
+    APP_DIRS = {
+        "alacritty", "btop", "cava", "dunst", "eww", "fastfetch", "foot",
+        "fuzzel", "ghostty", "gtk-2.0", "gtk-3.0", "gtk-4.0", "hypr",
+        "hypridle", "hyprland", "hyprlock", "hyprpaper", "hyprsunset",
+        "illogical-impulse", "kitty", "mako", "mpv", "niri", "noctalia",
+        "nvim", "qt5ct", "qt6ct", "quickshell", "river", "rofi", "sway",
+        "swaync", "thunar", "waybar", "wlogout", "wofi", "zathura", "yazi",
+    }
+    for app in APP_DIRS:
+        p = source / app
+        if p.is_dir():
+            add(f".config/{app}", p)
+
+    if (source / "bin").is_dir():
+        add(".local/bin", source / "bin", extra_paths=[".local/bin"])
+
+    home_layouts = (source, source / "home", source / "dotfiles")
+    home_dirs = (
+        ".themes",
+        ".icons",
+        ".fonts",
+        ".local/share/fonts",
+        ".local/share/icons",
+        ".local/share/themes",
+        ".local/share/backgrounds",
+        ".local/share/color-schemes",
+        ".local/share/konsole",
+        ".local/share/plasma",
+        ".local/share/kwin",
+        ".local/share/wallpapers",
+        ".local/share/aurorae",
+    )
+    for layout in home_layouts:
+        for relative in home_dirs:
+            add(relative, layout / relative)
+        for relative in ALLOWED_HOME_FILES:
+            add(relative, layout / relative)
+
+    # Common repository naming for resources kept outside the home tree.
+    for source_name, target in (
+        ("fonts", ".local/share/fonts"),
+        ("icons", ".icons"),
+        ("gtk-themes", ".themes"),
+        ("icon-themes", ".icons"),
+    ):
+        add(target, source / source_name)
+
+    return found
+
+
+def rewrite_config_paths(home_root: Path) -> int:
+    rewritten = 0
+    for root, _dirs, filenames in os.walk(home_root, followlinks=False):
+        for filename in filenames:
+            path = Path(root) / filename
+            if path.is_symlink() or (
+                path.suffix.lower() not in CONFIG_TEXT_EXTENSIONS
+                and path.name not in CONFIG_TEXT_NAMES
+            ):
+                continue
+            try:
+                if path.stat().st_size > MAX_CONFIG_TEXT_BYTES:
+                    continue
+                content = path.read_bytes()
+            except OSError as exc:
+                raise ThemeError(f"could not inspect imported config {path}: {exc}") from exc
+            if any(byte < 32 and byte not in (9, 10, 13) for byte in content):
+                continue
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            updated = HOME_PATH_RE.sub(f"{HOME.as_posix()}/", text)
+            if updated != text:
+                try:
+                    path.write_text(updated, encoding="utf-8")
+                except OSError as exc:
+                    raise ThemeError(f"could not rewrite imported config {path}: {exc}") from exc
+                rewritten += 1
+    return rewritten
+
+
+def cmd_import(args):
+    name = args.name
+    source = Path(args.source).resolve()
+    if not source.is_dir():
+        die(f"source not found: {source}")
+    valid_name(name)
+    root = themes_root()
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / name
+    if destination.exists():
+        die(f"Rice already exists: {name}")
+
+    # Check for existing manifest
+    existing_manifest = source / MANIFEST_NAME
+    staged = Path(tempfile.mkdtemp(prefix=f".{name}-import-", dir=root))
+    (staged / "home").mkdir(parents=True, exist_ok=True)
+    (staged / "assets").mkdir(parents=True, exist_ok=True)
+
+    try:
+        if existing_manifest.is_file():
+            data = read_json(existing_manifest)
+            if not isinstance(data, dict) or data.get("format") not in (1, 2):
+                raise ThemeError("existing manifest in source has an unsupported format")
+            data["extra_paths"] = list(validate_extra_paths(data.get("extra_paths", [])))
+            validate_process_fields(data, name)
+            if data["extra_paths"]:
+                warn(
+                    "Rice import opts in to extra paths: "
+                    + ", ".join(data["extra_paths"])
+                )
+            # Validate paths exist in source
+            paths = data.get("paths", [])
+            if not isinstance(paths, list) or not paths:
+                raise ThemeError("existing manifest has no valid paths")
+            ensure_no_overlap(paths)
+            for relative in paths:
+                safe_home_path(relative, extra_paths=data["extra_paths"])
+                src = source / "home" / relative
+                if not src.exists():
+                    src = source / relative
+                if not src.exists():
+                    raise ThemeError(f"manifest path missing in source: {relative}")
+                copy_tree(src, staged / "home" / relative)
+            source_assets = source / "assets"
+            if source_assets.is_dir():
+                copy_tree(source_assets, staged / "assets")
+            if data.get("wallpaper"):
+                wallpaper_value = data["wallpaper"]
+                if not isinstance(wallpaper_value, str):
+                    raise ThemeError("manifest wallpaper path must be a string")
+                if (source / wallpaper_value).is_symlink():
+                    raise ThemeError("manifest wallpaper symlinks are not allowed")
+                wp = safe_source(source, wallpaper_value)
+                if not wp.is_file():
+                    raise ThemeError(f"manifest wallpaper missing: {data['wallpaper']}")
+                relative_asset = PurePosixPath(wallpaper_value)
+                if not (relative_asset.parts[0] == "assets" and source_assets.is_dir()):
+                    asset = staged / "assets" / "wallpapers" / wp.name
+                    asset.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(wp, asset)
+                    data["wallpaper"] = asset.relative_to(staged).as_posix()
+            data["id"] = name
+            data["name"] = data.get("name", name)
+            atomic_json(staged / MANIFEST_NAME, data)
+        else:
+            discovered = discover_repository(source)
+            if not discovered:
+                shutil.rmtree(staged, ignore_errors=True)
+                die("no recognizable dotfiles found in source")
+            paths = sorted(discovered.keys())
+            extra_paths = sorted(
+                extra for extra in ALLOWED_EXTRA_PATHS
+                if any(path == extra or path.startswith(extra + "/") for path in paths)
+            )
+            if extra_paths:
+                warn(
+                    "Rice import opts in to extra paths: "
+                    + ", ".join(extra_paths)
+                )
+            for relative, src_path in discovered.items():
+                copy_tree(src_path, staged / "home" / relative)
+            manifest = {
+                "format": 1,
+                "id": name,
+                "name": name,
+                "description": f"Imported from {source}",
+                "paths": paths,
+                "extra_paths": extra_paths,
+                "settings": {},
+            }
+            wallpaper_dir = source / "wallpapers"
+            wallpaper_candidates = list(wallpaper_dir.iterdir()) if wallpaper_dir.is_dir() else []
+            if any(
+                path.is_symlink()
+                for path in wallpaper_candidates
+                if path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+            ):
+                raise ThemeError("wallpaper symlinks are not allowed")
+            wallpapers = sorted(
+                path for path in wallpaper_candidates
+                if path.is_file() and path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+            )
+            if wallpapers:
+                if any(image.stat().st_size > WALLPAPER_MAX_BYTES for image in wallpapers):
+                    raise ThemeError("an imported wallpaper exceeds the per-image size limit")
+                if sum(image.stat().st_size for image in wallpapers) > MAX_THEME_BYTES:
+                    raise ThemeError("imported wallpapers exceed the theme size limit")
+                wallpaper = wallpapers[0]
+                asset_dir = staged / "assets" / "wallpapers"
+                asset_dir.mkdir(parents=True, exist_ok=True)
+                for image in wallpapers:
+                    shutil.copy2(image, asset_dir / image.name)
+                manifest["wallpaper"] = (
+                    asset_dir / wallpaper.name
+                ).relative_to(staged).as_posix()
+            atomic_json(staged / MANIFEST_NAME, manifest)
+
+        if getattr(args, "rewrite_paths", True):
+            rewritten = rewrite_config_paths(staged / "home")
+            info(f"Rewrote hard-coded home paths in {rewritten} config file(s).")
+
+        # Validate the staged theme
+        # Re-run profile validation by temporarily treating staged as vault entry
+        # (lightweight check)
+        data = read_json(staged / MANIFEST_NAME)
+        data["tracked_paths"] = list(
+            validate_tracked_paths(data.get("tracked_paths", []))
+        )
+        validate_process_fields(data, name)
+        extra_paths = validate_extra_paths(data.get("extra_paths", []))
+        if (staged / "assets").is_dir():
+            validate_tree(staged / "assets")
+        for relative in data.get("paths", []):
+            safe_home_path(relative, extra_paths=extra_paths)
+            src = staged / "home" / relative
+            if not src.exists():
+                shutil.rmtree(staged, ignore_errors=True)
+                die(f"staged content missing: {relative}")
+            if src.is_dir():
+                validate_tree(src)
+
+        initialize_profile_history(staged, data)
+        staged.rename(destination)
+        info(f"Imported Rice: {name}")
+    except Exception:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Atomic apply
+# ---------------------------------------------------------------------------
+
+def cmd_apply_legacy(args):
+    name = args.name
+    dry_run = args.dry_run
+    directory, data = profile(name)
+
+    active = read_json(STATE / "active.json")
+    old_paths = active.get("paths", []) if active else []
+    new_paths = data.get("paths", [])
+    excludes = protected_paths(data)
+
+    # Remove protected paths from theme control entirely
+    new_paths = [p for p in new_paths if p not in excludes]
+    old_paths = [p for p in old_paths if p not in excludes]
+
+    # Union of all paths to snapshot
+    all_paths = []
+    seen = set()
+    for p in old_paths + new_paths:
+        if p not in seen:
+            seen.add(p)
+            all_paths.append(p)
+
+    # Preflight checks
+    for p in new_paths:
+        safe_home_path(p)
+    src_root = directory / "home"
+    for p in new_paths:
+        src = safe_source(src_root, p)
+        if not src.exists():
+            die(f"theme content missing: {p}")
+        if src.is_dir():
+            validate_tree(src)
+
+    total_size = sum(dir_size(safe_source(src_root, p)) for p in new_paths)
+    if total_size > MAX_THEME_BYTES:
+        die(f"theme too large: {total_size / (1024*1024):.1f} MB")
+
+    if dry_run:
+        info(f"[dry-run] Would switch Rice: {data.get('name', name)}")
+        info(f"  paths to replace: {', '.join(new_paths)}")
+        old_set = set(old_paths)
+        new_set = set(new_paths)
+        added = sorted(new_set - old_set)
+        removed = sorted(old_set - new_set)
+        common = sorted(new_set & old_set)
+        if added:
+            info(f"  would add: {', '.join(added)}")
+        if removed:
+            info(f"  would remove: {', '.join(removed)}")
+        if common:
+            info(f"  would replace: {', '.join(common)}")
+        if data.get("settings"):
+            info(f"  settings: {data['settings']}")
+        if data.get("wallpaper"):
+            info(f"  wallpaper: {data['wallpaper']}")
+        if data.get("post_apply"):
+            info(f"  post-apply: {', '.join(data['post_apply'])}")
+        info("dry-run complete, no changes made.")
+        return
+
+    # Lock
+    lock_path = STATE / "lock"
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        # Snapshot everything
+        snapshot_dir = STATE / "backups" / f"pre-{name}-{now_ts()}"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        runtime = {}
+        for p in all_paths:
+            target = safe_home_path(p)
+            snap = snapshot_dir / path_key(p)
+            runtime[p] = snapshot_item(target, snap)
+
+        runtime_settings = get_settings()
+        old_wallpaper = current_wallpaper()
+        runtime_image = None
+        if old_wallpaper and old_wallpaper.stat().st_size <= WALLPAPER_MAX_BYTES:
+            runtime_image = snapshot_dir / "wallpaper"
+            shutil.copy2(old_wallpaper, runtime_image)
+
+        try:
+            # Restore baseline for all paths first (clears old theme ownership)
+            baseline = baseline_for(all_paths)
+            for p in all_paths:
+                restore_item(
+                    safe_home_path(p),
+                    snapshot_dir / path_key(p),
+                    runtime[p],
+                )
+
+            # Apply new theme files
+            for p in new_paths:
+                source = safe_source(directory / "home", p)
+                target = safe_home_path(p)
+                staged = target.with_name(f".{target.name}.theme-{os.getpid()}")
+                remove_path(staged)
+
+                # Save any excluded files that exist in the current target
+                # so they survive the directory replacement below.
+                excluded_saved = {}
+                if target.exists() and target.is_dir():
+                    tmp = target.with_name(f".{target.name}.excluded-{os.getpid()}")
+                    tmp.mkdir(parents=True, exist_ok=True)
+                    for excl in sorted(excludes):
+                        if excl.startswith(p + "/"):
+                            inner = PurePosixPath(excl[len(p) + 1:])
+                            src_file = target / inner
+                            if src_file.exists():
+                                dest_file = tmp / inner
+                                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(src_file, dest_file)
+                                excluded_saved[excl] = (tmp, inner)
+
+                copy_entry(source, staged, excludes=excludes, rel_base=target)
+                remove_path(target)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staged, target)
+
+                # Restore excluded files into the new directory
+                for excl, (tmp, inner) in excluded_saved.items():
+                    dest_file = target / inner
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(tmp / inner, dest_file)
+                if excluded_saved:
+                    shutil.rmtree(target.with_name(f".{target.name}.excluded-{os.getpid()}"), ignore_errors=True)
+
+            # Apply settings
+            combined_settings = dict(runtime_settings)
+            combined_settings.update(data.get("settings", {}))
+            apply_settings(combined_settings)
+
+            # Wallpaper
+            wallpaper = data.get("wallpaper")
+            if wallpaper:
+                apply_wallpaper(safe_source(directory, wallpaper))
+            elif baseline.get("wallpaper"):
+                apply_wallpaper(Path(baseline["wallpaper"]))
+
+            # Post-apply hooks
+            for cmd in data.get("post_apply", []):
+                try:
+                    subprocess.run(cmd.split(), check=False, capture_output=True, timeout=30)
+                except (subprocess.SubprocessError, OSError):
+                    warn(f"post-apply command failed: {cmd}")
+
+            # Reload apps
+            reload_apps(new_paths)
+
+            # Health check
+            time.sleep(HEALTH_CHECK_WAIT)
+            hc_ok = True
+            for cmd in data.get("health_check", ["hyprctl monitors"]):
+                try:
+                    result = subprocess.run(cmd.split(), check=False,
+                                            capture_output=True, timeout=15)
+                    if result.returncode != 0:
+                        hc_ok = False
+                        warn(f"health check failed: {cmd}")
+                except (subprocess.SubprocessError, OSError):
+                    hc_ok = False
+                    warn(f"health check error: {cmd}")
+
+            if not hc_ok:
+                # Rollback
+                warn("health check failed, rolling back...")
+                for p in all_paths:
+                    restore_item(
+                        safe_home_path(p),
+                        snapshot_dir / path_key(p),
+                        runtime[p],
+                    )
+                apply_settings(runtime_settings)
+                if runtime_image:
+                    apply_wallpaper(runtime_image)
+                raise ThemeError(f"theme {name} failed health check, rolled back")
+
+            # Commit active state (store effective paths + excludes)
+            atomic_json(STATE / "active.json", {
+                "profile": name,
+                "name": data.get("name", name),
+                "paths": new_paths,
+                "excludes": sorted(excludes),
+            })
+            # Save baseline
+            atomic_json(STATE / "baseline.json", baseline)
+            info(f"Switched Rice: {data.get('name', name)}")
+            if excludes:
+                info(f"Protected (unchanged): {', '.join(sorted(excludes))}")
+
+        except Exception:
+            # Rollback on any exception
+            for p in all_paths:
+                restore_item(
+                    safe_home_path(p),
+                    snapshot_dir / path_key(p),
+                    runtime[p],
+                )
+            apply_settings(runtime_settings)
+            if runtime_image:
+                apply_wallpaper(runtime_image)
+            raise
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def cmd_apply(args):
+    apply_profile(args.name, dry_run=args.dry_run, force=args.force)
+
+
+def cmd_use(args):
+    use_theme(args.name, force=args.force)
+    if not args.restart_session:
+        return
+    try:
+        answer = input("Restart the Hyprland session now? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        return
+    try:
+        result = subprocess.run(
+            ["hyprctl", "dispatch", "exit"],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise ThemeError(f"could not restart the Hyprland session: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or b"").decode(errors="replace").strip()
+        raise ThemeError(
+            "could not restart the Hyprland session"
+            + (f": {detail}" if detail else "")
+        )
+
+
+def add_theme(name, source, *, directory=None, branch=None, rewrite_paths=True):
+    """Import a local dotfiles directory or shallow-clone a Git repository."""
+    valid_name(name)
+    local_source = Path(source).expanduser()
+    clone_source = None
+    if local_source.is_dir() and branch is None:
+        repository = local_source.resolve()
+    else:
+        valid_url = re.match(r"^(https?|ssh|git|file)://", source) or re.match(
+            r"^[^/\s:]+@[^:\s]+:", source
+        )
+        if not valid_url and not local_source.is_dir():
+            raise ThemeError(f"source is neither a directory nor a supported Git URL: {source}")
+        clone_source = str(local_source.resolve()) if local_source.is_dir() else source
+
+    def selected_directory(root):
+        if not directory:
+            return root
+        selected = (root / directory).resolve()
+        if not selected.is_relative_to(root.resolve()):
+            raise ThemeError(f"repository subdirectory escapes its root: {directory}")
+        if not selected.is_dir():
+            raise ThemeError(f"repository subdirectory not found: {directory}")
+        return selected
+
+    class Args:
+        pass
+
+    def import_directory(path):
+        args = Args()
+        args.name = name
+        args.source = str(selected_directory(path))
+        args.rewrite_paths = rewrite_paths
+        cmd_import(args)
+
+    if clone_source is None:
+        import_directory(repository)
+        return
+
+    if branch is not None and (not branch.strip() or branch.startswith("-")):
+        raise ThemeError(f"invalid Git branch name: {branch!r}")
+    with tempfile.TemporaryDirectory(prefix=f"{name}-git-") as temp_dir:
+        checkout = Path(temp_dir) / "checkout"
+        command = ["git", "clone", "--depth", "1"]
+        if branch:
+            command.extend(["--branch", branch])
+        command.extend(["--", clone_source, str(checkout)])
+        env = os.environ.copy()
+        env.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LFS_SKIP_SMUDGE": "1",
+        })
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=env,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise ThemeError(f"git clone failed: {exc}") from exc
+        if result.returncode:
+            detail = (result.stderr or "").strip()
+            raise ThemeError(
+                "git clone failed" + (f": {detail}" if detail else "")
+            )
+        import_directory(checkout)
+
+
+def copy_entry(source: Path, destination: Path, *, preserve_root_link=False, excludes=None, rel_base=None):
+    """Copy a single file or directory tree, skipping excluded paths.
+    
+    rel_base is the intended final path (under HOME) used for exclude matching,
+    so temp staged paths don't interfere.
+    """
+    if excludes is None:
+        excludes = set()
+    base = rel_base if rel_base is not None else destination
+    try:
+        rel = base.relative_to(HOME).as_posix()
+    except ValueError:
+        rel = str(base)
+    if rel in excludes:
+        return  # skip protected files (keybinds, fonts, etc.)
+    if source.is_symlink() and not preserve_root_link:
+        link_target = os.readlink(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(link_target, destination)
+        return
+    if source.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        for child in sorted(source.iterdir()):
+            child_base = (rel_base / child.name) if rel_base is not None else None
+            copy_entry(child, destination / child.name,
+                       preserve_root_link=preserve_root_link,
+                       excludes=excludes, rel_base=child_base)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+# ---------------------------------------------------------------------------
+# Undo / restore
+# ---------------------------------------------------------------------------
+
+def cmd_undo(_args):
+    if not (STATE / "active.json").is_file():
+        die("no active theme to undo")
+    backups = sorted(
+        (path for path in (STATE / "backups").glob("pre-*") if (path / "state.json").is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not backups:
+        die("no restorable backup found")
+    restore_backup(backups[0])
+
+
+def cmd_restore(args):
+    backup_path = STATE / "backups" / args.backup_id
+    if not backup_path.is_dir():
+        die(f"backup not found: {args.backup_id}")
+    restore_backup(backup_path)
+
+
+def restore_backup(backup_path):
+    state = read_json(backup_path / "state.json")
+    if not isinstance(state, dict) or not isinstance(state.get("snapshots"), dict):
+        raise ThemeError(f"backup is not restorable: {backup_path.name}")
+    current_active = read_json(STATE / "active.json")
+    current_data = {}
+    if isinstance(current_active, dict) and current_active.get("profile"):
+        _, current_data = profile(current_active["profile"])
+    target_active = state.get("active")
+    target_data = {}
+    if isinstance(target_active, dict) and target_active.get("profile"):
+        _, target_data = profile(target_active["profile"])
+    extra_paths = validate_extra_paths(state.get("extra_paths", []))
+    try:
+        for relative in state.get("paths", []):
+            meta = state["snapshots"].get(relative)
+            if not isinstance(meta, dict):
+                raise ThemeError(f"backup metadata missing for {relative}")
+            restore_item(
+                safe_home_path(relative, extra_paths=extra_paths),
+                backup_path / path_key(relative),
+                meta,
+            )
+        apply_settings(state.get("settings", {}))
+        if state.get("wallpaper_snapshot") and (backup_path / "wallpaper").is_file():
+            apply_wallpaper(backup_path / "wallpaper")
+        for filename, key in (("active.json", "active"), ("baseline.json", "baseline")):
+            saved = state.get(key)
+            path = STATE / filename
+            if saved is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_json(path, saved)
+        paths = state.get("paths", [])
+        reload_apps(paths)
+        stop_rice(current_data)
+        start_rice(target_data)
+    except Exception:
+        try:
+            stop_rice(target_data)
+        except Exception as stop_error:
+            warn(f"could not stop restored theme processes: {stop_error}")
+        try:
+            reload_apps(current_active.get("paths", []) if current_active else [])
+            start_rice(current_data)
+        except Exception as start_error:
+            warn(f"could not restart previous theme processes: {start_error}")
+        raise
+    info(f"Restored backup: {backup_path.name}")
+
+
+# ---------------------------------------------------------------------------
+# Doctor
+# ---------------------------------------------------------------------------
+
+def cmd_doctor(_args):
+    issues = []
+    ok = []
+    # Check dependencies
+    for dep in ["hyprctl", "wallust", "waybar", "swaync", "quickshell"]:
+        if shutil.which(dep):
+            ok.append(dep)
+        else:
+            issues.append(f"missing command: {dep}")
+    # Check directories
+    root = themes_root()
+    if root.is_dir():
+        ok.append(f"vault: {root}")
+    else:
+        issues.append(f"missing vault: {root}")
+    if STATE.is_dir():
+        ok.append(f"state: {STATE}")
+    else:
+        issues.append(f"missing state: {STATE}")
+    # Check active theme validity
+    active = read_json(STATE / "active.json")
+    if active:
+        try:
+            profile(active["profile"])
+            ok.append(f"active theme valid: {active['profile']}")
+        except ThemeError as e:
+            issues.append(f"active theme invalid: {e}")
+    for installed in list_profiles():
+        label = (
+            f"active theme {installed['id']}"
+            if active and active.get("profile") == installed["id"]
+            else f"theme {installed['id']}"
+        )
+        try:
+            _, data = profile(installed["id"])
+        except ThemeError as exc:
+            issues.append(f"{label} invalid: {exc}")
+            continue
+        missing = missing_requirements(data)
+        if missing:
+            issues.append(f"{label} missing requires: {', '.join(missing)}")
+        else:
+            ok.append(f"{label} requirements available")
+    # Check disk space
+    total, used, free = shutil.disk_usage(HOME)
+    if free < 1024 ** 3:
+        issues.append(f"low disk space: {free / (1024**3):.1f} GB free")
+    else:
+        ok.append(f"disk free: {free / (1024**3):.1f} GB")
+    # Hyprland running?
+    try:
+        subprocess.run(["hyprctl", "version"], check=False, capture_output=True, timeout=5)
+        ok.append("Hyprland is running")
+    except (subprocess.SubprocessError, OSError):
+        issues.append("Hyprland not running or hyprctl failed")
+
+    info("=== Rice Profile Doctor ===")
+    if ok:
+        info("OK:")
+        for o in ok:
+            info(f"  - {o}")
+    if issues:
+        info("Issues:")
+        for i in issues:
+            info(f"  - {i}")
+    else:
+        info("No issues found.")
+
+
+# ---------------------------------------------------------------------------
+# TUI Selector
+# ---------------------------------------------------------------------------
+
+def move_selection(current, key, count):
+    if count <= 0:
+        return 0
+    if key in (curses.KEY_UP, ord("k")):
+        return (current - 1) % count
+    if key in (curses.KEY_DOWN, ord("j")):
+        return (current + 1) % count
+    if key == curses.KEY_HOME:
+        return 0
+    if key == curses.KEY_END:
+        return count - 1
+    if key == curses.KEY_PPAGE:
+        return max(0, current - max(1, count // 5))
+    if key == curses.KEY_NPAGE:
+        return min(count - 1, current + max(1, count // 5))
+    return max(0, min(current, count - 1))
+
+
+def profile_preview_palette(profile_dir: Path):
+    """Extract a small color palette from a profile for the terminal preview."""
+    root = Path(profile_dir) / "home" / ".config"
+    colors = {}
+    quickshell = root / "rumda/common/quickshell/dark/config/Colors.qml"
+    if quickshell.is_file():
+        text = quickshell.read_text(encoding="utf-8", errors="replace")
+        for field, pattern in (
+            ("background", r"backgroundColor\s*:\s*['\"]?(#[0-9A-Fa-f]{6})"),
+            ("accent", r"accentColor\s*:\s*['\"]?(#[0-9A-Fa-f]{6})"),
+        ):
+            match = re.search(pattern, text)
+            if match:
+                colors[field] = match.group(1).lower()
+
+    for path in sorted(root.rglob("*")) if root.is_dir() else ():
+        if not path.is_file() or path.suffix.lower() not in (".conf", ".rasi", ".css", ".qml"):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            match = re.search(
+                r"(?:^|\s)(background|color\d+)\s*(?:=|\s)\s*['\"]?(#[0-9A-Fa-f]{6})",
+                line,
+                re.IGNORECASE,
+            )
+            if match:
+                colors[match.group(1).lower()] = match.group(2).lower()
+        if not colors.get("accent"):
+            match = re.search(
+                r"accentColor\s*:\s*['\"]?(#[0-9A-Fa-f]{6})",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                colors["accent"] = match.group(1).lower()
+
+    colors.setdefault("background", "#202124")
+    colors.setdefault("color0", colors["background"])
+    colors.setdefault("accent", colors.get("color1", "#8ab4f8"))
+    colors["surface"] = colors["color0"]
+    colors["swatches"] = [
+        colors["accent"],
+        *[
+        colors[key] for key in sorted(
+            (key for key in colors if re.fullmatch(r"color\d+", key)),
+            key=lambda key: int(key[5:]),
+        ) if colors[key] != colors["accent"]
+        ],
+    ]
+    return colors
+
+
+def _draw(screen, y, x, text, width, attr=0):
+    if y < 0 or y >= screen.getmaxyx()[0] or width <= 0:
+        return
+    try:
+        screen.addnstr(y, max(0, x), str(text), max(0, width - max(0, x)), attr)
+    except curses.error:
+        pass
+
+
+def _kitty_graphics_supported():
+    return bool(os.environ.get("KITTY_WINDOW_ID")) or os.environ.get("TERM") == "xterm-kitty"
+
+
+def _delete_kitty_logo():
+    if _kitty_graphics_supported():
+        sys.stdout.write(f"\x1b_Ga=d,d=i,i={KITTY_LOGO_ID},q=2\x1b\\")
+        sys.stdout.flush()
+
+
+def _render_kitty_logo(columns):
+    if not _kitty_graphics_supported() or not THEME_LOGO.is_file():
+        return None
+    image = THEME_LOGO.read_bytes()
+    logo_columns = min(68, columns - 8)
+    if logo_columns < 24:
+        return None
+    logo_rows = max(3, round(logo_columns * 2 * 100 / 1800))
+    cursor_column = max(1, (columns - logo_columns) // 2 + 1)
+    payload = base64.b64encode(image).decode("ascii")
+    chunks = [payload[index:index + 4096] for index in range(0, len(payload), 4096)]
+
+    sys.stdout.write(f"\x1b[1;{cursor_column}H")
+    for index, chunk in enumerate(chunks):
+        more = int(index < len(chunks) - 1)
+        if index == 0:
+            header = (
+                f"a=T,f=100,i={KITTY_LOGO_ID},c={logo_columns},"
+                f"r={logo_rows},q=2,m={more}"
+            )
+        else:
+            header = f"m={more},q=2"
+        sys.stdout.write(f"\x1b_G{header};{chunk}\x1b\\")
+    sys.stdout.flush()
+    return (columns, logo_columns, logo_rows)
+
+
+def _terminal_color(hex_color):
+    """Map a #RRGGBB color to the nearest supported terminal color index."""
+    red, green, blue = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    if curses.COLORS >= 256:
+        levels = (0, 95, 135, 175, 215, 255)
+        r, g, b = (min(range(6), key=lambda i: abs(levels[i] - v))
+                   for v in (red, green, blue))
+        return 16 + 36 * r + 6 * g + b
+
+    palette = (
+        (curses.COLOR_BLACK, (0, 0, 0)),
+        (curses.COLOR_RED, (170, 0, 0)),
+        (curses.COLOR_GREEN, (0, 170, 0)),
+        (curses.COLOR_YELLOW, (170, 85, 0)),
+        (curses.COLOR_BLUE, (0, 0, 170)),
+        (curses.COLOR_MAGENTA, (170, 0, 170)),
+        (curses.COLOR_CYAN, (0, 170, 170)),
+        (curses.COLOR_WHITE, (170, 170, 170)),
+    )
+    return min(
+        palette,
+        key=lambda item: sum((channel - value) ** 2 for channel, value in zip(item[1], (red, green, blue))),
+    )[0]
+
+
+def _picker_colors(palette):
+    colors = {}
+    if not curses.has_colors():
+        return colors
+    try:
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        accent = _terminal_color(palette.get("accent", "#00aaaa"))
+        styles = (
+            ("title", curses.COLOR_CYAN, -1),
+            ("selected", curses.COLOR_WHITE, accent),
+            ("active", curses.COLOR_GREEN, -1),
+            ("muted", curses.COLOR_WHITE, -1),
+            ("accent", accent, -1),
+        )
+        for pair, (name, foreground, background) in enumerate(styles, start=1):
+            try:
+                curses.init_pair(pair, foreground, background)
+                colors[name] = curses.color_pair(pair)
+            except curses.error:
+                continue
+        for index, color in enumerate(palette.get("swatches", [])[:6]):
+            pair = 20 + index
+            if pair >= curses.COLOR_PAIRS:
+                break
+            try:
+                curses.init_pair(pair, curses.COLOR_WHITE, _terminal_color(color))
+                colors[f"swatch-{index}"] = curses.color_pair(pair) | curses.A_BOLD
+            except curses.error:
+                continue
+    except curses.error:
+        return colors
+    return colors
+
+
+def _draw_palette(screen, y, x, width, palette, attrs):
+    if y < 0 or width <= 0 or y + 1 >= screen.getmaxyx()[0]:
+        return
+    right = x + width
+    _draw(screen, y, x, "PALETTE", right, attrs.get("accent", curses.A_BOLD))
+    cursor = x
+    for index, color in enumerate(palette.get("swatches", [])[:6]):
+        label = f" {color} "
+        swatch_attr = attrs.get(f"swatch-{index}", 0)
+        chip = "   " if swatch_attr else "██ "
+        if cursor + len(chip) + len(label) > right:
+            break
+        _draw(screen, y + 1, cursor, chip, right, swatch_attr)
+        _draw(screen, y + 1, cursor + len(chip), label, right, attrs.get("muted", 0))
+        cursor += len(chip) + len(label) + 1
+
+
+def _draw_box(screen, y, x, height, width, title, attrs):
+    rows, columns = screen.getmaxyx()
+    if height < 2 or width < 2 or y >= rows or x >= columns:
+        return
+    right = min(columns, x + width)
+    bottom = min(rows, y + height)
+    inside = max(0, right - x - 2)
+    label = f" {title} " if title else ""
+    top = "┌" + label[:inside] + "─" * max(0, inside - len(label[:inside])) + "┐"
+    _draw(screen, y, x, top, right, attrs.get("accent", curses.A_DIM))
+    _draw(screen, bottom - 1, x, "└" + "─" * inside + "┘", right, attrs.get("accent", curses.A_DIM))
+    for row in range(y + 1, bottom - 1):
+        _draw(screen, row, x, "│", right, attrs.get("accent", curses.A_DIM))
+        _draw(screen, row, right - 1, "│", right, attrs.get("accent", curses.A_DIM))
+
+
+def _draw_logo(screen, y, width, attrs):
+    columns = screen.getmaxyx()[1]
+    emblem = "◈  RICE  ◈"
+    subtitle = "C O M P L E T E   D E S K T O P   P R O F I L E S"
+    _draw(
+        screen,
+        y + 2,
+        max(0, (columns - len(emblem)) // 2),
+        emblem,
+        width,
+        attrs.get("title", curses.A_BOLD),
+    )
+    _draw(
+        screen,
+        y + 4,
+        max(0, (columns - len(subtitle)) // 2),
+        subtitle,
+        width,
+        attrs.get("muted", curses.A_DIM),
+    )
+
+
+def terminal_picker(screen, items, active_id=None):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    screen.keypad(True)
+    screen.nodelay(False)
+    current = 0
+    if active_id:
+        for i, it in enumerate(items):
+            if it["id"] == active_id:
+                current = i
+                break
+
+    palettes = [
+        profile_preview_palette(item.get("_dir", Path(".")))
+        for item in items
+    ]
+    attrs = _picker_colors(palettes[current])
+    kitty_layout = None
+
+    while True:
+        screen.erase()
+        h, w = screen.getmaxyx()
+        if h < 18 or w < 24:
+            _draw(screen, 0, 0, "Resize terminal or press q to exit.", w, curses.A_BOLD)
+            screen.refresh()
+            if screen.getch() in (ord("q"), ord("Q")):
+                return None
+            continue
+
+        active = next((item for item in items if item["id"] == active_id), None)
+        status = (
+            f"ACTIVE  {active.get('name', active_id)}"
+            if active else "Choose a profile to preview"
+        )
+        if not _kitty_graphics_supported():
+            _draw_logo(screen, 0, w - 2, attrs)
+        _draw(screen, 7, 2, "RICE VAULT  /  STUDIO", w - 4, attrs.get("title", curses.A_BOLD))
+        _draw(screen, 8, 2, status, w - 4, attrs.get("active", curses.A_DIM))
+        _draw(screen, 9, 0, "─" * w, w, attrs.get("accent", curses.A_DIM))
+
+        body_y = 10
+        body_height = h - 13
+        wide = w >= 78 and body_height >= 9
+        if wide:
+            left_width = min(36, max(29, w * 36 // 100))
+            right_x = left_width + 2
+            right_width = w - right_x - 1
+            _draw_box(screen, body_y, 1, body_height, left_width, "RICE PROFILES", attrs)
+            _draw_box(screen, body_y, right_x, body_height, right_width, "LIVE PREVIEW", attrs)
+            list_x = 3
+            list_width = left_width - 4
+            list_y = body_y + 1
+            list_height = body_height - 2
+        else:
+            list_height = body_height
+            preview_height = 0
+            if body_height >= 10:
+                list_height = max(5, body_height // 2)
+                preview_height = body_height - list_height
+            _draw_box(screen, body_y, 1, list_height, w - 2, "RICE PROFILES", attrs)
+            if preview_height >= 5:
+                _draw_box(
+                    screen,
+                    body_y + list_height,
+                    1,
+                    preview_height,
+                    w - 2,
+                    "LIVE PREVIEW",
+                    attrs,
+                )
+            list_x = 3
+            list_width = w - 6
+            list_y = body_y + 1
+            list_height = max(1, list_height - 2)
+
+        start = max(0, min(current - list_height // 2, max(0, len(items) - list_height)))
+        for idx in range(start, min(start + list_height, len(items))):
+            item = items[idx]
+            row = list_y + idx - start
+            marker = "›" if idx == current else " "
+            label = f"{marker}  {item.get('name') or item['id']}"
+            if item["id"] == active_id:
+                label += "  [ACTIVE]"
+            if idx == current:
+                attr = attrs.get("selected", curses.A_REVERSE | curses.A_BOLD)
+            elif item["id"] == active_id:
+                attr = attrs.get("active", curses.A_BOLD)
+            else:
+                attr = 0
+            _draw(screen, row, list_x, label, list_x + list_width, attr)
+
+        preview = palettes[current]
+        selected = items[current]
+        if wide:
+            preview_x = right_x + 2
+            preview_width = right_width - 4
+            row = body_y + 1
+            _draw(screen, row, preview_x, selected.get("name", selected["id"]), preview_x + preview_width, curses.A_BOLD)
+            row += 1
+            paths = selected.get("paths", [])
+            _draw(
+                screen,
+                row,
+                preview_x,
+                f"ID  {selected['id']}  |  {len(paths)} components",
+                preview_x + preview_width,
+                attrs.get("muted", curses.A_DIM),
+            )
+            row += 1
+            palette_y = body_y + body_height - 3
+            description = selected.get("description", "No description available.")
+            for line in textwrap.wrap(description, max(1, preview_width), max_lines=2):
+                if row >= palette_y - 3:
+                    break
+                _draw(screen, row, preview_x, line, preview_x + preview_width, attrs.get("muted", curses.A_DIM))
+                row += 1
+            row += 1
+            if row < palette_y - 1:
+                _draw(screen, row, preview_x, "COMPONENTS", preview_x + preview_width, attrs.get("accent", curses.A_BOLD))
+                row += 1
+            for path in paths[:5]:
+                if row >= palette_y - 1:
+                    break
+                _draw(screen, row, preview_x, f"  {path}", preview_x + preview_width, 0)
+                row += 1
+            if len(paths) > 5 and row < palette_y - 1:
+                _draw(
+                    screen,
+                    row,
+                    preview_x,
+                    f"  +{len(paths) - 5} more components",
+                    preview_x + preview_width,
+                    attrs.get("muted", curses.A_DIM),
+                )
+            _draw_palette(screen, palette_y, preview_x, preview_width, preview, attrs)
+        elif preview_height >= 5:
+            preview_x = 3
+            preview_width = w - 6
+            preview_y = body_y + body_height - preview_height
+            _draw(
+                screen,
+                preview_y + 1,
+                preview_x,
+                f"{selected.get('name', selected['id'])}  ·  {len(selected.get('paths', []))} components",
+                preview_x + preview_width,
+                curses.A_BOLD,
+            )
+            _draw_palette(
+                screen,
+                preview_y + 2,
+                preview_x,
+                preview_width,
+                preview,
+                attrs,
+            )
+
+        footer = "↑/↓ Move   Enter Apply   r Changes   q Exit"
+        _draw(screen, h - 2, 2, footer, w - 4, attrs.get("muted", curses.A_DIM))
+        screen.refresh()
+        if _kitty_graphics_supported() and kitty_layout != w:
+            if kitty_layout is not None:
+                _delete_kitty_logo()
+            kitty_layout = w if _render_kitty_logo(w) is not None else None
+
+        key = screen.getch()
+        if key in (ord("q"), ord("Q")):
+            if kitty_layout is not None:
+                _delete_kitty_logo()
+            return None
+        elif key in (
+            curses.KEY_UP, curses.KEY_DOWN, curses.KEY_HOME, curses.KEY_END,
+            curses.KEY_PPAGE, curses.KEY_NPAGE, ord("j"), ord("k"),
+        ):
+            current = move_selection(current, key, len(items))
+            attrs = _picker_colors(palettes[current])
+        elif key in (ord("r"), ord("R")):
+            if kitty_layout is not None:
+                _delete_kitty_logo()
+            return ("reset", items[current]["id"])
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if kitty_layout is not None:
+                _delete_kitty_logo()
+            return items[current]["id"]
+
+
+def terminal_change_picker(screen, profile_name, changes):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    screen.keypad(True)
+    current = len(changes) - 1
+    palette = profile_preview_palette(themes_root() / profile_name)
+    attrs = _picker_colors(palette)
+
+    while True:
+        screen.erase()
+        height, width = screen.getmaxyx()
+        if height < 12 or width < 40:
+            _draw(screen, 0, 0, "Resize terminal or press q to cancel.", width, curses.A_BOLD)
+            screen.refresh()
+            if screen.getch() in (ord("q"), ord("Q")):
+                return None
+            continue
+
+        _draw(screen, 1, 2, f"RICE CHANGES  /  {profile_name}", width - 2, attrs.get("title", curses.A_BOLD))
+        _draw(screen, 2, 2, "Select a change to restore its previous version.", width - 2, attrs.get("muted", curses.A_DIM))
+        _draw(screen, 3, 0, "─" * width, width, attrs.get("accent", curses.A_DIM))
+
+        left_width = min(46, max(30, width // 2))
+        _draw_box(screen, 4, 1, height - 7, left_width, "CHANGE HISTORY", attrs)
+        _draw_box(screen, 4, left_width + 2, height - 7, width - left_width - 3, "BEFORE / AFTER", attrs)
+        visible = height - 9
+        start = max(0, min(current - visible // 2, max(0, len(changes) - visible)))
+        for index in range(start, min(start + visible, len(changes))):
+            change = changes[index]
+            row = 5 + index - start
+            status = "RESTORED" if change.get("restored") else change["status"].upper()
+            label = f"{status:8} {change['path']}"
+            attr = attrs.get("selected", curses.A_REVERSE | curses.A_BOLD) if index == current else 0
+            _draw(screen, row, 3, label, left_width, attr)
+
+        selected = changes[current]
+        diff_lines = _history_change_diff(themes_root() / profile_name, selected)
+        diff_x = left_width + 4
+        diff_right = width - 2
+        for row, line in enumerate(diff_lines[:height - 10], start=5):
+            color = attrs.get("accent", 0) if line.startswith("+++") or line.startswith("---") else 0
+            _draw(screen, row, diff_x, line, diff_right, color)
+
+        _draw(screen, height - 2, 2, "↑/↓ or j/k  Select   Enter  Restore   q  Cancel", width - 2, attrs.get("muted", curses.A_DIM))
+        screen.refresh()
+        key = screen.getch()
+        if key in (ord("q"), ord("Q")):
+            return None
+        if key in (curses.KEY_UP, ord("k")):
+            current = (current - 1) % len(changes)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            current = (current + 1) % len(changes)
+        elif key in (curses.KEY_HOME,):
+            current = 0
+        elif key in (curses.KEY_END,):
+            current = len(changes) - 1
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return selected["id"]
+
+
+def cmd_reset(args):
+    changes = collect_profile_changes(args.name)
+    if getattr(args, "change", None):
+        restore_profile_change(args.name, args.change)
+        return
+    if not changes:
+        info(f"No changes recorded for Rice {args.name}.")
+        return
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        info(f"Changes recorded for Rice {args.name}:")
+        for change in changes:
+            restored = " [restored]" if change.get("restored") else ""
+            info(
+                f"  {change['id'][:8]}  {change['status']:<8} "
+                f"{change['path']}  {change['timestamp']}{restored}"
+            )
+        info(f"Restore one with: theme reset {args.name} --change CHANGE_ID")
+        return
+
+    try:
+        selected = curses.wrapper(
+            terminal_change_picker,
+            args.name,
+            changes,
+        )
+    except curses.error as exc:
+        die(f"failed to open Rice change history: {exc}")
+    if not selected:
+        return
+    change = next(item for item in changes if item["id"] == selected)
+    try:
+        answer = input(
+            f"Restore {change['path']} to the version before this change? [y/N] "
+        ).strip().lower()
+    except EOFError:
+        answer = ""
+    if answer in ("y", "yes"):
+        restore_profile_change(args.name, selected)
+
+
+def cmd_select(_args):
+    items = list_profiles()
+    if not items:
+        die("no Rice profiles installed")
+    active_id = None
+    active = read_json(STATE / "active.json")
+    if active:
+        active_id = active.get("profile")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        die("run 'theme select' inside an interactive terminal")
+    locale.setlocale(locale.LC_ALL, "")
+    try:
+        selected = curses.wrapper(terminal_picker, items, active_id)
+    except curses.error as e:
+        die(f"failed to open terminal picker: {e}")
+    if selected:
+        if isinstance(selected, tuple) and selected[0] == "reset":
+            cmd_reset(argparse.Namespace(name=selected[1], change=None))
+            return
+        class A: pass
+        a = A()
+        a.name = selected
+        a.dry_run = False
+        a.force = False
+        cmd_apply(a)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="theme",
+        description="Switch complete Hyprland Rice profiles with isolated configs.",
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
+
+    p_list = sub.add_parser("list", help="list installed Rice profiles")
+    p_list.add_argument("--json", action="store_true", help="output profiles as JSON")
+    sub.add_parser("status", help="show the active Rice")
+    sub.add_parser("doctor", help="run health checks")
+
+    p_preview = sub.add_parser("preview", help="preview a Rice switch")
+    p_preview.add_argument("name")
+
+    p_capture = sub.add_parser("capture", help="capture the current setup as a Rice")
+    p_capture.add_argument("name", nargs="?", default="current")
+
+    p_import = sub.add_parser("import", help="import a Rice from a local folder")
+    p_import.add_argument("name")
+    p_import.add_argument("source")
+    p_import.add_argument("--no-rewrite-paths", action="store_true")
+
+    p_add = sub.add_parser("add", help="import a Rice without applying it")
+    p_add.add_argument("name")
+    p_add.add_argument("source")
+    p_add.add_argument("--dir", help="import from a subdirectory of the repository")
+    p_add.add_argument("--branch", help="clone a specific Git branch")
+    p_add.add_argument("--no-rewrite-paths", action="store_true")
+
+    p_use = sub.add_parser("use", help="switch to an installed Rice")
+    p_use.add_argument("name")
+    p_use.add_argument("--force", action="store_true", help="skip requires checks")
+    p_use.add_argument(
+        "--restart-session",
+        action="store_true",
+        help="ask before restarting the Hyprland session after switching",
+    )
+
+    p_reset = sub.add_parser(
+        "reset",
+        help="inspect Rice changes and selectively restore a previous version",
+    )
+    p_reset.add_argument("name")
+    p_reset.add_argument("--change", help="restore a specific change ID")
+
+    p_apply = sub.add_parser("apply", help="switch to a Rice")
+    p_apply.add_argument("name")
+    p_apply.add_argument("--dry-run", action="store_true")
+    p_apply.add_argument("--force", action="store_true", help="skip requires checks")
+
+    sub.add_parser("undo", help="restore the previous Rice")
+
+    p_restore = sub.add_parser("restore", help="restore a backup (manual)")
+    p_restore.add_argument("backup_id")
+
+    sub.add_parser("select", help="interactive Rice picker (TUI)")
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "list":
+            cmd_list(args)
+        elif args.command == "status":
+            cmd_status(args)
+        elif args.command == "preview":
+            cmd_preview(args)
+        elif args.command == "capture":
+            cmd_capture(args)
+        elif args.command == "import":
+            args.rewrite_paths = not args.no_rewrite_paths
+            cmd_import(args)
+        elif args.command == "add":
+            add_theme(
+                args.name,
+                args.source,
+                directory=args.dir,
+                branch=args.branch,
+                rewrite_paths=not args.no_rewrite_paths,
+            )
+        elif args.command == "use":
+            cmd_use(args)
+        elif args.command == "reset":
+            cmd_reset(args)
+        elif args.command == "apply":
+            cmd_apply(args)
+        elif args.command == "undo":
+            cmd_undo(args)
+        elif args.command == "restore":
+            cmd_restore(args)
+        elif args.command == "doctor":
+            cmd_doctor(args)
+        elif args.command == "select":
+            cmd_select(args)
+        else:
+            # No command: open interactive arrow-key picker
+            cmd_select(args)
+    except ThemeError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        print("\naborted.", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

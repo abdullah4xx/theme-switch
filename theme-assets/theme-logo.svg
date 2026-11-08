@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="100" viewBox="0 0 1800 100" fill="none">
+  <defs>
+    <linearGradient id="mark" x1="8" y1="8" x2="92" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#75E6D0"/>
+      <stop offset=".48" stop-color="#6A9CFF"/>
+      <stop offset="1" stop-color="#B18CFF"/>
+    </linearGradient>
+    <linearGradient id="word" x1="130" y1="20" x2="730" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset=".62" stop-color="#D8E4FF"/>
+      <stop offset="1" stop-color="#8DB8FF"/>
+    </linearGradient>
+    <linearGradient id="line" x1="820" y1="50" x2="1710" y2="50" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#75E6D0" stop-opacity=".85"/>
+      <stop offset=".5" stop-color="#6A9CFF" stop-opacity=".45"/>
+      <stop offset="1" stop-color="#B18CFF" stop-opacity=".08"/>
+    </linearGradient>
+    <filter id="shadow" x="0" y="0" width="110" height="110" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+  <circle cx="50" cy="50" r="44" fill="#6A9CFF" fill-opacity=".24" filter="url(#shadow)"/>
+  <path d="M50 4 91 27.5v45L50 96 9 72.5v-45L50 4Z" fill="url(#mark)"/>
+  <path d="m50 17 29 16.5v33L50 83 21 66.5v-33L50 17Z" fill="#111827" fill-opacity=".82"/>
+  <path d="m50 27 20 11.5v23L50 73 30 61.5v-23L50 27Z" fill="url(#mark)" fill-opacity=".92"/>
+  <path d="m50 36 11 6.5v13L50 62l-11-6.5v-13L50 36Z" fill="#F8FAFC"/>
+  <circle cx="83" cy="18" r="5" fill="#F9C784"/>
+  <circle cx="17" cy="81" r="4" fill="#75E6D0"/>
+  <text x="128" y="67" fill="url(#word)" font-family="Inter,DejaVu Sans,sans-serif" font-size="61" font-weight="800" letter-spacing="3">RICE</text>
+  <text x="134" y="88" fill="#AAB8CF" font-family="Inter,DejaVu Sans,sans-serif" font-size="12" font-weight="600" letter-spacing="5">COMPLETE DESKTOP PROFILES</text>
+  <path d="M625 50H1695" stroke="url(#line)" stroke-width="2"/>
+  <path d="m1704 50 12-7v14l-12-7Z" fill="#75E6D0" fill-opacity=".8"/>
+  <circle cx="1740" cy="50" r="3" fill="#B18CFF"/>
+  <circle cx="1760" cy="50" r="2" fill="#75E6D0" fill-opacity=".7"/>
+</svg>
